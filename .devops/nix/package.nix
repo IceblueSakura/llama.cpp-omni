@@ -3,7 +3,7 @@
   glibc,
   config,
   stdenv,
-  stdenvNoCC,
+  buildPackages,
   runCommand,
   cmake,
   ninja,
@@ -13,15 +13,12 @@
   blas,
   cudaPackages,
   autoAddDriverRunpath,
-  darwin,
   rocmPackages,
   vulkan-headers,
   vulkan-loader,
   openssl,
   shaderc,
   spirv-headers,
-  nodejs,
-  importNpmLock,
   useBlas ?
     builtins.all (x: !x) [
       useCuda
@@ -79,17 +76,6 @@ let
     ln -s /usr/bin/xcrun $out/bin
   '';
 
-  # apple_sdk is supposed to choose sane defaults, no need to handle isAarch64
-  # separately
-  darwinBuildInputs =
-    with darwin.apple_sdk.frameworks;
-    [
-      Accelerate
-      CoreVideo
-      CoreGraphics
-    ]
-    ++ optionals useMetalKit [ MetalKit ];
-
   cudaBuildInputs = with cudaPackages; [
     cuda_cudart
     cccl # <nv/target>
@@ -134,20 +120,25 @@ effectiveStdenv.mkDerivation (finalAttrs: {
   };
 
   # Builds the webui locally, taking care not to require updating any sha256 hash.
-  webui = stdenvNoCC.mkDerivation {
+  #
+  # NOTE(llama.cpp-omni): use buildPackages.* so this also evaluates when
+  # cross-compiling (e.g. pkgsCross.mingwW64), where a target-platform `nodejs`
+  # does not exist. Upstream ggml-org/llama.cpp currently fails
+  # `nix eval .#packages.x86_64-linux.windows.drvPath` because of this.
+  webui = buildPackages.stdenvNoCC.mkDerivation {
     pname = "webui";
     version = llamaVersion;
     src = lib.cleanSource ../../tools/ui;
 
     nativeBuildInputs = [
-      nodejs
-      importNpmLock.linkNodeModulesHook
+      buildPackages.nodejs
+      buildPackages.importNpmLock.linkNodeModulesHook
     ];
 
     # no sha256 required when using buildNodeModules
-    npmDeps = importNpmLock.buildNodeModules {
+    npmDeps = buildPackages.importNpmLock.buildNodeModules {
       npmRoot = ../../tools/ui;
-      inherit nodejs;
+      nodejs = buildPackages.nodejs;
     };
 
     installPhase = ''
@@ -184,8 +175,7 @@ effectiveStdenv.mkDerivation (finalAttrs: {
     ++ optionals (effectiveStdenv.hostPlatform.isDarwin && useMetalKit && precompileMetalShaders) [ xcrunHost ];
 
   buildInputs =
-    optionals effectiveStdenv.hostPlatform.isDarwin darwinBuildInputs
-    ++ optionals useCuda cudaBuildInputs
+    optionals useCuda cudaBuildInputs
     ++ optionals useMpi [ mpi ]
     ++ optionals useRocm rocmBuildInputs
     ++ optionals useBlas [ blas ]
