@@ -25,17 +25,17 @@ def main():
     # 获取脚本目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
     service_script = os.path.join(script_dir, "token2wav_service.py")
-    
+
     # 创建输出目录
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
+
     print(f"启动 Token2Wav 服务...")
     print(f"模型目录: {MODEL_DIR}")
     print(f"参考音频: {REF_AUDIO}")
     print(f"输出目录: {OUTPUT_DIR}")
     print(f"设备: {DEVICE}")
     print()
-    
+
     # 启动服务进程
     env = os.environ.copy()
     process = subprocess.Popen(
@@ -47,20 +47,20 @@ def main():
         text=True,
         bufsize=1
     )
-    
+
     def send_cmd(cmd):
         """发送命令并获取响应"""
         cmd_json = json.dumps(cmd)
         print(f">>> {cmd_json}")
         process.stdin.write(cmd_json + "\n")
         process.stdin.flush()
-        
+
         response_line = process.stdout.readline()
         response = json.loads(response_line)
         print(f"<<< {json.dumps(response, ensure_ascii=False)}")
         print()
         return response
-    
+
     try:
         # 等待服务就绪
         print("等待服务就绪...")
@@ -68,7 +68,7 @@ def main():
         ready = json.loads(ready_line)
         print(f"服务状态: {ready}")
         print()
-        
+
         # 1. 初始化
         print("=" * 50)
         print("1. 初始化 Token2Wav")
@@ -80,11 +80,11 @@ def main():
             "float16": True,
             "n_timesteps": 10
         })
-        
+
         if response.get("status") != "ok":
             print(f"初始化失败: {response}")
             return
-        
+
         # 2. 设置参考音频
         print("=" * 50)
         print("2. 设置参考音频")
@@ -93,49 +93,49 @@ def main():
             "cmd": "set_ref_audio",
             "ref_audio_path": REF_AUDIO
         })
-        
+
         if response.get("status") != "ok":
             print(f"设置参考音频失败: {response}")
             return
-        
+
         # 3. 处理 tokens
         print("=" * 50)
         print("3. 处理 tokens")
         print("=" * 50)
-        
+
         # 模拟滑动窗口处理
         for i in range(3):
             tokens = TEST_TOKENS[:]
             is_last = (i == 2)
             output_path = os.path.join(OUTPUT_DIR, f"wav_{i}.wav")
-            
+
             response = send_cmd({
                 "cmd": "process",
                 "tokens": tokens,
                 "last_chunk": is_last,
                 "output_path": output_path
             })
-            
+
             if response.get("status") != "ok":
                 print(f"处理失败: {response}")
                 break
-        
+
         # 4. 重置缓存
         print("=" * 50)
         print("4. 重置缓存")
         print("=" * 50)
         response = send_cmd({"cmd": "reset"})
-        
+
         # 5. 退出
         print("=" * 50)
         print("5. 退出服务")
         print("=" * 50)
         response = send_cmd({"cmd": "quit"})
-        
+
     finally:
         # 等待进程结束
         process.wait(timeout=5)
-        
+
         # 打印 stderr
         stderr = process.stderr.read()
         if stderr:

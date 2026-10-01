@@ -203,7 +203,7 @@ struct vision_ctx {
     ggml_backend_buffer_ptr buf;
 
     int max_nodes = 8192;
-    
+
     // 🔧 [高清模式] 运行时覆盖 max_slice_nums，-1 表示使用模型默认值
     int max_slice_nums_override = -1;
 
@@ -394,7 +394,7 @@ struct vision_graph {
             cb(K, "resampler_K", -1);
             cb(V, "resampler_V", -1);
 
-            const float resampler_kq_scale = 1.0f / sqrtf((float)d_head);  
+            const float resampler_kq_scale = 1.0f / sqrtf((float)d_head);
 
             embeddings = build_attn(
                 model.mm_model_attn_o_w,
@@ -1207,7 +1207,7 @@ struct vision_model_loader {
                     hparams.minicpmv_query_num = 64;
                 }
             }
-            
+
             // for pinpoints, we need to convert it into a list of resolution candidates
             {
                 std::vector<int> pinpoints;
@@ -1244,7 +1244,7 @@ struct vision_model_loader {
                     log_ffn_op = "gelu_quick";
                 }
             }
-            
+
             int idx_mean = gguf_find_key(ctx_gguf.get(), KEY_IMAGE_MEAN);
             int idx_std  = gguf_find_key(ctx_gguf.get(), KEY_IMAGE_STD);
             GGML_ASSERT(idx_mean >= 0 && "image_mean not found");
@@ -1300,7 +1300,7 @@ struct vision_model_loader {
             LOG_INF("%s: n_layer:            %d\n", __func__, hparams.n_layer);
             LOG_INF("%s: ffn_op:             %s\n", __func__, log_ffn_op.c_str());
             LOG_INF("%s: projection_dim:     %d\n", __func__, hparams.projection_dim);
-            
+
             LOG_INF("\n--- vision hparams ---\n");
             LOG_INF("%s: image_size:         %d\n", __func__, hparams.image_size);
             LOG_INF("%s: patch_size:         %d\n", __func__, hparams.patch_size);
@@ -1308,7 +1308,7 @@ struct vision_model_loader {
             LOG_INF("%s: proj_scale_factor:  %d\n", __func__, hparams.proj_scale_factor);
             LOG_INF("%s: n_wa_pattern:       %d\n", __func__, hparams.n_wa_pattern);
             LOG_INF("%s: insert_layer_id:     %d\n", __func__, hparams.insert_layer_id);
-            
+
             LOG_INF("\n");
             LOG_INF("%s: model size:         %.2f MiB\n", __func__, model_size / 1024.0 / 1024.0);
             LOG_INF("%s: metadata size:      %.2f MiB\n", __func__, ggml_get_mem_size(ctx_meta.get()) / 1024.0 / 1024.0);
@@ -1515,7 +1515,7 @@ struct vision_model_loader {
         // create a fake batch
         vision_image_f32_batch batch;
         vision_image_f32_ptr img(vision_image_f32_init());
-        img->nx = hparams.warmup_image_size;    
+        img->nx = hparams.warmup_image_size;
         img->ny = hparams.warmup_image_size;
         batch.entries.push_back(std::move(img));
 
@@ -1896,8 +1896,8 @@ struct llava_uhd {
 
         {
             // 🔧 [高清模式] 优先使用运行时覆盖值，否则使用模型默认值
-            const int max_slice_nums = (ctx->max_slice_nums_override >= 0) 
-                                       ? ctx->max_slice_nums_override 
+            const int max_slice_nums = (ctx->max_slice_nums_override >= 0)
+                                       ? ctx->max_slice_nums_override
                                        : ctx->model.hparams.minicpmv_max_slice_nums;
             const float log_ratio = log((float)original_width / original_height);
             const float ratio = (float)original_width * original_height / (slice_size * slice_size);
@@ -2374,7 +2374,7 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
             }
         }
         set_input_f32("inp_raw", inp_raw);
-    } 
+    }
 
     // set input per projector
     switch (ctx->model.model_type) {

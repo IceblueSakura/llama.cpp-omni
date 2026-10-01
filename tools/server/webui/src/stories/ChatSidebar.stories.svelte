@@ -52,7 +52,7 @@
 	name="Default"
 	play={async () => {
 		const { chatStore } = await import('$lib/stores/chat.svelte');
-		
+
 		waitFor(() => setTimeout(() => {
 			chatStore.conversations = mockConversations;
 		}, 0));
@@ -68,11 +68,11 @@
 	name="SearchActive"
 	play={async ({ userEvent }) => {
 		const { chatStore } = await import('$lib/stores/chat.svelte');
-		
+
 		waitFor(() => setTimeout(() => {
 			chatStore.conversations = mockConversations;
 		}, 0));
-		
+
 		const searchTrigger = screen.getByText('Search conversations');
 		userEvent.click(searchTrigger);
 	}}

@@ -158,16 +158,16 @@ struct audition_model {
     ggml_tensor * whisper_e_conv_2_b = nullptr;
     ggml_tensor * whisper_e_ln_w = nullptr;
     ggml_tensor * whisper_e_ln_b = nullptr;
-    
+
     // whisper layers
     std::vector<whisper_layer> whisper_layers;
-    
+
     // audio projector
     ggml_tensor * whisper_proj_1_w = nullptr;
     ggml_tensor * whisper_proj_1_b = nullptr;
     ggml_tensor * whisper_proj_2_w = nullptr;
     ggml_tensor * whisper_proj_2_b = nullptr;
-    
+
     // mel filters data (loaded from gguf file)
     std::vector<float> whisper_filters_data;
 
@@ -196,10 +196,10 @@ struct audition_model {
 struct whisper_kv_cache {
     std::vector<ggml_tensor*> k_l;  // K cache for each layer [n_layer]
     std::vector<ggml_tensor*> v_l;  // V cache for each layer [n_layer]
-    
+
     ggml_context* ctx = nullptr;     // ggml context for KV cache tensors
     ggml_backend_buffer_t buffer = nullptr;  // backend buffer for KV cache
-    
+
     int n_layer = 0;   // number of layers
     int size = 0;      // fixed cache size (n_audio_ctx, e.g., 1500)
     int iter = 0;      // current iteration count for streaming
@@ -222,7 +222,7 @@ struct audition_ctx {
 
     int max_nodes = 8192;
     ggml_backend_sched_ptr sched;
-    
+
     // Whisper KV cache for streaming
     struct whisper_kv_cache whisper_kv_cache;
     bool whisper_streaming_mode = true;
@@ -340,19 +340,19 @@ struct audition_graph {
     }
 
     ggml_cgraph * build_whisper() {
-        
+
         const int n_frames = audio.nx;  // mel spectrogram frames
         const int n_mels = audio.ny;    // mel bins number
         const int n_state = hparams.n_embd;
         const int n_head = hparams.n_head;
         const int n_layer = hparams.n_layer;
-        
+
         const int n_state_head = n_state / n_head;
         const float KQscale = 1.0f / sqrtf(float(n_state_head));
-        
-        // LOG_INF("%s: Building whisper encoder graph - n_frames=%d, n_mels=%d, n_state=%d, n_head=%d, n_layer=%d\n", 
+
+        // LOG_INF("%s: Building whisper encoder graph - n_frames=%d, n_mels=%d, n_state=%d, n_head=%d, n_layer=%d\n",
         //         __func__, n_frames, n_mels, n_state, n_head, n_layer);
-        
+
         // Step 1: build input tensor
         // input [2*n_ctx, n_mels] 2D tensor
         // n_frames == 2*n_ctx
@@ -360,52 +360,52 @@ struct audition_graph {
         ggml_set_name(inp_raw, "inp_raw");
         ggml_set_input(inp_raw);
 
-        
-        // LOG_INF("%s: Created inp_raw tensor with shape [%d, %d] = %ld elements (whisper format)\n", 
+
+        // LOG_INF("%s: Created inp_raw tensor with shape [%d, %d] = %ld elements (whisper format)\n",
         //         __func__, n_frames, n_mels, ggml_nelements(inp_raw));
-        
+
         // 直接使用inp_raw作为mel输入
         ggml_tensor * mel = inp_raw;
         ggml_tensor * cur = mel;
-        
+
         // Step 2: conv layers + GELU activation (721-732)
         {
-            // LOG_INF("%s: Before conv1d - input shape: [%ld, %ld, %ld, %ld]\n", __func__, 
+            // LOG_INF("%s: Before conv1d - input shape: [%ld, %ld, %ld, %ld]\n", __func__,
             //         cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
-            // LOG_INF("%s: Conv1 weight shape: [%ld, %ld, %ld, %ld]\n", __func__, 
-            //         model.whisper_e_conv_1_w->ne[0], model.whisper_e_conv_1_w->ne[1], 
+            // LOG_INF("%s: Conv1 weight shape: [%ld, %ld, %ld, %ld]\n", __func__,
+            //         model.whisper_e_conv_1_w->ne[0], model.whisper_e_conv_1_w->ne[1],
             //         model.whisper_e_conv_1_w->ne[2], model.whisper_e_conv_1_w->ne[3]);
-            
+
             // conv1
             cur = ggml_conv_1d_ph(ctx0, model.whisper_e_conv_1_w, cur, 1, 1);
             cur = ggml_add(ctx0, cur, model.whisper_e_conv_1_b);
             cur = ggml_gelu(ctx0, cur);
-            
+
             // conv2 (stride=2, downsample)
             cur = ggml_conv_1d_ph(ctx0, model.whisper_e_conv_2_w, cur, 2, 1);
             cur = ggml_add(ctx0, cur, model.whisper_e_conv_2_b);
             cur = ggml_gelu(ctx0, cur);
         }
-        
+
         {
             // sequence length after conv
             const int n_tokens = cur->ne[0];
-            
+
             // calculate iter loop
             auto & kv_cache = ctx->whisper_kv_cache;
             const int n_audio_ctx = hparams.n_ctx;  // 1500
             const int n_iter = n_audio_ctx / n_tokens;  // 1500 / 50 = 30
 
             const int effective_iter = kv_cache.buffer != nullptr ? kv_cache.iter : 0;
-            
+
             // LOG_INF("%s: Position encoding - n_tokens=%d, n_audio_ctx=%d, n_iter=%d, effective_iter=%d\n",
             //         __func__, n_tokens, n_audio_ctx, n_iter, effective_iter);
-            
+
             // create position encoding view (with offset, whisper_encoder.cpp:1032-1035)
             const size_t e_pe_stride = model.whisper_e_pe->ne[0] * ggml_element_size(model.whisper_e_pe);
             const size_t e_pe_total_bytes = ggml_nbytes(model.whisper_e_pe);
             const size_t e_pe_view_bytes = model.whisper_e_pe->ne[0] * n_tokens * ggml_element_size(model.whisper_e_pe);
-            
+
             // Calculate position encoding offset with bounds checking
             // If effective_iter exceeds the buffer capacity, use modulo to wrap around
             // or reset KV cache if it's too large
@@ -419,62 +419,62 @@ struct audition_graph {
             } else {
                 e_pe_offset = model.whisper_e_pe->ne[0] * ggml_element_size(model.whisper_e_pe) * n_tokens * effective_iter;
             }
-            
+
             // Final bounds check for position encoding view
             if (e_pe_offset + e_pe_view_bytes > e_pe_total_bytes) {
                 LOG_ERR("%s: FATAL - Position encoding view would overflow! offset=%zu, view_size=%zu, total_size=%zu, effective_iter=%d\n",
                         __func__, e_pe_offset, e_pe_view_bytes, e_pe_total_bytes, effective_iter);
                 throw std::runtime_error("Position encoding buffer overflow - view exceeds bounds");
             }
-            
+
             // LOG_INF("%s: Position encoding offset - e_pe_offset=%zu bytes, e_pe_view_bytes=%zu, e_pe_total_bytes=%zu (pe_dim=%ld, elem_size=%zu, effective_iter=%d)\n",
             //         __func__, e_pe_offset, e_pe_view_bytes, e_pe_total_bytes, model.whisper_e_pe->ne[0], ggml_element_size(model.whisper_e_pe), effective_iter);
-            
-            ggml_tensor * e_pe = ggml_view_2d(ctx0, model.whisper_e_pe, 
+
+            ggml_tensor * e_pe = ggml_view_2d(ctx0, model.whisper_e_pe,
                                             model.whisper_e_pe->ne[0], n_tokens,
-                                            e_pe_stride, 
+                                            e_pe_stride,
                                             e_pe_offset);
-            
+
             // transpose and add position encoding (whisper_encoder.cpp:1036)
             cur = ggml_add(ctx0, e_pe, ggml_cont(ctx0, ggml_transpose(ctx0, cur)));
         }
-        
+
         ggml_tensor * inpL = cur;
-        
+
         // Step 4: Transformer encoder layers (800-940)
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.whisper_layers[il];
-            
+
             // Pre-attention layer norm
             {
                 cur = ggml_norm(ctx0, inpL, hparams.eps);
                 cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.attn_ln_0_w), layer.attn_ln_0_b);
             }
-            
+
             // Self-attention (with KV cache reading - Phase 2)
             {
                 // Query, Key, Value projections
                 ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q_w, cur);
                 Qcur = ggml_add(ctx0, Qcur, layer.attn_q_b);
-                
+
                 ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k_w, cur); // no bias for key
-                
+
                 ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v_w, cur);
                 Vcur = ggml_add(ctx0, Vcur, layer.attn_v_b);
-                
+
                 // Reshape for multi-head attention
                 const int n_tokens = cur->ne[1]; // sequence length (current chunk)
-                
+
                 // Reshape current K and V
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, n_tokens);
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_state_head, n_head, n_tokens);
                 Vcur = ggml_reshape_3d(ctx0, Vcur, n_state_head, n_head, n_tokens);
-                
+
                 ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
-                
+
                 // Step 5: store (1073-1091), then read (1096-1111)
                 auto & kv_cache = ctx->whisper_kv_cache;
-                
+
                 // Store
                 if (kv_cache.buffer != nullptr) {
                     // Calculate bounds checking
@@ -482,10 +482,10 @@ struct audition_graph {
                     const int current_total_tokens = kv_cache.iter * n_tokens;
                     const int new_total_tokens = current_total_tokens + tokens_to_write;
                     const int max_tokens = kv_cache.size; // n_audio_ctx (1500)
-                    
+
                     // LOG_INF("%s: Layer %d - KV cache bounds check: iter=%d, n_tokens=%d, current_total=%d, new_total=%d, max_tokens=%d\n",
                     //         __func__, il, kv_cache.iter, n_tokens, current_total_tokens, new_total_tokens, max_tokens);
-                    
+
                     // Bounds check: ensure we don't write beyond cache size
                     if (new_total_tokens > max_tokens) {
                         // LOG_ERR("%s: FATAL - KV cache overflow detected! iter=%d, n_tokens=%d, current_total=%d, new_total=%d, max_tokens=%d\n",
@@ -494,50 +494,50 @@ struct audition_graph {
                         //         __func__, new_total_tokens, max_tokens);
                         throw std::runtime_error("KV cache buffer overflow - exceeded cache size");
                     }
-                    
+
                     // Check if we have enough space for this write
                     if (current_total_tokens + tokens_to_write > max_tokens) {
                         // LOG_ERR("%s: FATAL - Not enough space in KV cache for write! Need %d tokens, have %d available\n",
                         //         __func__, tokens_to_write, max_tokens - current_total_tokens);
                         throw std::runtime_error("KV cache buffer overflow - not enough space");
                     }
-                    
+
                     const size_t k_offset_bytes = ggml_row_size(kv_cache.k_l[il]->type, n_state) * (kv_cache.iter * n_tokens);
                     const size_t k_total_bytes = ggml_row_size(kv_cache.k_l[il]->type, n_state) * tokens_to_write;
                     const size_t k_cache_total_bytes = ggml_nbytes(kv_cache.k_l[il]);
-                    
+
                     // LOG_INF("%s: Layer %d - Writing KV cache: iter=%d, n_tokens=%d, k_offset=%zu, k_write_bytes=%zu, k_cache_total=%zu\n",
                     //         __func__, il, kv_cache.iter, n_tokens, k_offset_bytes, k_total_bytes, k_cache_total_bytes);
-                    
+
                     // Additional bounds check: ensure offset + write size doesn't exceed cache size
                     if (k_offset_bytes + k_total_bytes > k_cache_total_bytes) {
                         // LOG_ERR("%s: FATAL - K cache write would overflow! offset=%zu, write_size=%zu, cache_size=%zu\n",
                         //         __func__, k_offset_bytes, k_total_bytes, k_cache_total_bytes);
                         throw std::runtime_error("K cache buffer overflow - write exceeds cache bounds");
                     }
-                    
+
                     // K cache store
-                    ggml_tensor * k_cache_view = ggml_view_1d(ctx0, kv_cache.k_l[il], 
-                                                              n_tokens * n_state, 
+                    ggml_tensor * k_cache_view = ggml_view_1d(ctx0, kv_cache.k_l[il],
+                                                              n_tokens * n_state,
                                                               k_offset_bytes);
                     ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k_cache_view));
-                    
+
                     // V cache store (overwrite Vcur)
                     Vcur = ggml_reshape_2d(ctx0, Vcur, n_state, n_tokens);
-                    
+
                     ggml_tensor * v_cache_view = nullptr;
                     const bool v_trans = true;
-                    
+
                     if (!v_trans) {
                         throw std::runtime_error("non-transposed V cache not supported");
                     } else {
                         const size_t v_offset_bytes = kv_cache.iter * n_tokens * ggml_element_size(kv_cache.v_l[il]);
                         const size_t v_row_size = kv_cache.size * ggml_element_size(kv_cache.v_l[il]);
                         const size_t v_cache_total_bytes = ggml_nbytes(kv_cache.v_l[il]);
-                        
+
                         // LOG_INF("%s: Layer %d - V cache write: v_offset=%zu, v_row_size=%zu, v_cache_total=%zu\n",
                         //         __func__, il, v_offset_bytes, v_row_size, v_cache_total_bytes);
-                        
+
                         // Bounds check for V cache
                         // V cache is stored as [n_audio_ctx, n_state] with transposed layout
                         // Each row is n_state elements, and we have n_audio_ctx rows
@@ -547,7 +547,7 @@ struct audition_graph {
                             //         __func__, v_offset_bytes, v_write_bytes, v_cache_total_bytes);
                             throw std::runtime_error("V cache buffer overflow - write exceeds cache bounds");
                         }
-                        
+
                         v_cache_view = ggml_view_2d(ctx0, kv_cache.v_l[il],
                                                     n_tokens, n_state,
                                                     v_row_size,
@@ -556,40 +556,40 @@ struct audition_graph {
                     }
                     ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v_cache_view));
                 }
-                
+
                 // Step 2: create K and V views for attention
                 ggml_tensor * K = nullptr;
                 ggml_tensor * V = nullptr;
-                
+
                 if (kv_cache.buffer != nullptr) {
                     // KV cache initialized, create views for all history
                     // iter not increased yet, so total_tokens = n_tokens * (iter + 1)
                     const int total_tokens = n_tokens * (kv_cache.iter + 1);
                     const int max_tokens = kv_cache.size;
-                    
+
                     // LOG_INF("%s: Layer %d - KV cache read: iter=%d, n_tokens=%d, total_tokens=%d, max_tokens=%d\n",
                     //         __func__, il, kv_cache.iter, n_tokens, total_tokens, max_tokens);
-                    
+
                     // Bounds check: ensure we don't read beyond cache size
                     if (total_tokens > max_tokens) {
                         LOG_ERR("%s: FATAL - KV cache read overflow! total_tokens=%d, max_tokens=%d\n",
                                 __func__, total_tokens, max_tokens);
                         throw std::runtime_error("KV cache buffer overflow - read exceeds cache size");
                     }
-                    
+
                     // Clamp total_tokens to cache size as safety measure
                     const int safe_total_tokens = std::min(total_tokens, max_tokens);
                     if (safe_total_tokens != total_tokens) {
                         LOG_WRN("%s: Layer %d - Clamping total_tokens from %d to %d to prevent overflow\n",
                                 __func__, il, total_tokens, safe_total_tokens);
                     }
-                    
+
                     K = ggml_view_3d(ctx0, kv_cache.k_l[il],
                                      n_state_head, safe_total_tokens, n_head,
                                      ggml_row_size(kv_cache.k_l[il]->type, n_state),
                                      ggml_row_size(kv_cache.k_l[il]->type, n_state_head),
                                      0);
-                    
+
                     // V cache: physical layout uses transposed storage with row stride = kv_cache.size
                     // 读取时stride必须与存储时一致！
                     // 存储时: v_cache_view row_stride = kv_cache.size * elem_size
@@ -599,7 +599,7 @@ struct audition_graph {
                         safe_total_tokens, n_state,
                         v_read_row_stride,  // row stride 必须与存储时一致
                         0);  // offset (start from beginning)
-                    
+
                     // 关键修复：V_2d是 [T, S]，但内存按T方向连续存储
                     // 需要先transpose成 [S, T] 并cont，才能正确reshape成 [D, H, T]
                     // 1. V_2d [T, S] -> transpose -> [S, T] (non-contiguous view)
@@ -607,11 +607,11 @@ struct audition_graph {
                     // 3. reshape -> [D, H, T] 其中 S = D*H
                     ggml_tensor * V_2d_t = ggml_cont(ctx0, ggml_transpose(ctx0, V_2d));
                     // V_2d_t: [n_state, safe_total_tokens] contiguous
-                    
+
                     // Reshape from [n_state, safe_total_tokens] to [n_state_head, n_head, safe_total_tokens]
                     ggml_tensor * V_3d = ggml_reshape_3d(ctx0, V_2d_t, n_state_head, n_head, safe_total_tokens);
                     // V_3d: [D, H, T] 其中 (d, h, t) 对应原始 V_2d[t, d + h*D]
-                    
+
                     // Permute to [n_head, safe_total_tokens, n_state_head] to match non-cache path
                     V = ggml_cast(ctx0, ggml_permute(ctx0, V_3d, 1, 2, 0, 3), GGML_TYPE_F16);
                     // V: [H, T, D]
@@ -621,32 +621,32 @@ struct audition_graph {
                     K = ggml_permute(ctx0,
                                    ggml_cast(ctx0, Kcur, GGML_TYPE_F16),
                                    0, 2, 1, 3);
-                    
+
                     V = ggml_cast(ctx0,
                                 ggml_permute(ctx0, Vcur, 1, 2, 0, 3),
                                 GGML_TYPE_F16);
                 }
-                
+
                 // Step 3: Attention computation
                 ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
                 ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
-                
+
                 ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
                 ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
                 cur = ggml_cont_2d(ctx0, KQV_merged, n_state, n_tokens);
             }
-            
+
             // Attention output projection
             {
                 cur = ggml_mul_mat(ctx0, layer.attn_ln_1_w, cur);
                 cur = ggml_add(ctx0, cur, layer.attn_ln_1_b);
             }
-            
+
             // Residual connection
             cur = ggml_add(ctx0, cur, inpL);
-            
+
             ggml_tensor * inpFF = cur;
-            
+
             // Feed-forward network
             {
                 // Pre-FFN layer norm
@@ -654,28 +654,28 @@ struct audition_graph {
                     cur = ggml_norm(ctx0, inpFF, hparams.eps);
                     cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.mlp_ln_w), layer.mlp_ln_b);
                 }
-                
+
                 // FFN layers
                 cur = ggml_mul_mat(ctx0, layer.mlp_0_w, cur);
                 cur = ggml_add(ctx0, cur, layer.mlp_0_b);
                 cur = ggml_gelu(ctx0, cur);
-                
+
                 cur = ggml_mul_mat(ctx0, layer.mlp_1_w, cur);
                 cur = ggml_add(ctx0, cur, layer.mlp_1_b);
             }
-            
+
             // FFN residual connection
             inpL = ggml_add(ctx0, cur, inpFF);
         }
-        
+
         cur = inpL;
-        
+
         // Step 5: last layer norm
         {
             cur = ggml_norm(ctx0, cur, hparams.eps);
             cur = ggml_add(ctx0, ggml_mul(ctx0, cur, model.whisper_e_ln_w), model.whisper_e_ln_b);
         }
-        
+
         // Step 6: audio projector (954-971)
         // NOTE: average pooling (k=2, s=5) is NOT supported by ggml_pool_1d when k != s
         // So we only do the projector here, pooling is done manually in audition_audio_batch_encode
@@ -684,11 +684,11 @@ struct audition_graph {
             cur = ggml_mul_mat(ctx0, model.whisper_proj_1_w, cur);
             cur = ggml_add(ctx0, cur, model.whisper_proj_1_b);
             cur = ggml_relu(ctx0, cur);
-            
+
             // second projector layer
             cur = ggml_mul_mat(ctx0, model.whisper_proj_2_w, cur);
             cur = ggml_add(ctx0, cur, model.whisper_proj_2_b);
-            
+
             // Average pooling (k=5, s=5, p=0) along token dimension
             // pool_1d operates on ne[0], so we permute to move tokens to ne[0]
             // Output tokens = (input_tokens - 5) / 5 + 1 (floor division)
@@ -700,9 +700,9 @@ struct audition_graph {
                 ggml_permute(ctx0, cur, 1, 0, 2, 3),  // [tokens, embd] -> [embd, tokens]
                 ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cur->ne[1], cur->ne[0]));
         }
-        
+
         ggml_build_forward_expand(gf, cur);
-        
+
         LOG_INF("%s: Whisper encoder graph built (projector output, pre-pooling)\n", __func__);
         return gf;
     }
@@ -818,7 +818,7 @@ struct audition_model_loader {
                 get_u32("d_model", hparams.n_embd);
                 get_u32("encoder_attention_heads", hparams.n_head);
                 get_u32("encoder_layers", hparams.n_layer);
-                
+
                 // Validate critical parameters
                 if (hparams.n_embd == 0) {
                     throw std::runtime_error(string_format("%s: invalid n_embd (d_model) = 0\n", __func__));
@@ -830,29 +830,29 @@ struct audition_model_loader {
                     throw std::runtime_error(string_format("%s: invalid n_layer (encoder_layers) = 0\n", __func__));
                 }
                 if (hparams.n_embd % hparams.n_head != 0) {
-                    throw std::runtime_error(string_format("%s: n_embd (%d) must be divisible by n_head (%d)\n", 
+                    throw std::runtime_error(string_format("%s: n_embd (%d) must be divisible by n_head (%d)\n",
                         __func__, hparams.n_embd, hparams.n_head));
                 }
-                
+
                 // FFN dimension
                 hparams.n_ff = hparams.n_embd * 4;
-                
+
                 // read mel bins number from gguf
                 get_u32("n_mel", hparams.n_mel_bins, false);
                 if (hparams.n_mel_bins == 0) {
                     hparams.n_mel_bins = 80; //  80 mel bins
                 }
-                
+
                 // read n_fft from gguf
                 get_u32("n_fft", hparams.n_fft, false);
                 if (hparams.n_fft == 0) {
                     hparams.n_fft = 400; // whisper n_fft
                 }
-                
+
                 // other parameters
                 hparams.eps = 1e-5f; // layer norm epsilon
                 hparams.projection_dim = 0; // processed by audio projector
-                
+
                 // For whisper models, patch_size is not used but needs to be set to avoid errors
                 // Try to read from GGUF, otherwise set a default value
                 get_u32("patch_size", hparams.patch_size, false);
@@ -864,11 +864,11 @@ struct audition_model_loader {
                 if (hparams.n_ctx == 0) {
                     hparams.n_ctx = 1500; // whisper default audio context length
                 }
-                
-                LOG_INF("%s: Custom whisper encoder - n_embd=%d, n_head=%d, n_layer=%d, n_mel_bins=%d, n_fft=%d, n_ctx=%d, patch_size=%d\n", 
+
+                LOG_INF("%s: Custom whisper encoder - n_embd=%d, n_head=%d, n_layer=%d, n_mel_bins=%d, n_fft=%d, n_ctx=%d, patch_size=%d\n",
                         __func__, hparams.n_embd, hparams.n_head, hparams.n_layer, hparams.n_mel_bins, hparams.n_fft, hparams.n_ctx, hparams.patch_size);
             } else {
-                LOG_INF("%s: Using standard parameter loading (is_audio=%d, model_type=%d)\n", 
+                LOG_INF("%s: Using standard parameter loading (is_audio=%d, model_type=%d)\n",
                         __func__, is_audio, model.model_type);
 
                 get_u32(string_format(KEY_N_EMBD,         prefix), hparams.n_embd);
@@ -933,11 +933,11 @@ struct audition_model_loader {
             LOG_INF("%s: n_layer:            %d\n", __func__, hparams.n_layer);
             LOG_INF("%s: ffn_op:             %s\n", __func__, log_ffn_op.c_str());
             LOG_INF("%s: projection_dim:     %d\n", __func__, hparams.projection_dim);
-            
+
             LOG_INF("\n--- audio hparams ---\n");
             LOG_INF("%s: n_mel_bins:         %d\n", __func__, hparams.n_mel_bins);
             LOG_INF("%s: proj_stack_factor:  %d\n", __func__, hparams.proj_stack_factor);
-                
+
             LOG_INF("\n");
             LOG_INF("%s: model size:         %.2f MiB\n", __func__, model_size / 1024.0 / 1024.0);
             LOG_INF("%s: metadata size:      %.2f MiB\n", __func__, ggml_get_mem_size(ctx_meta.get()) / 1024.0 / 1024.0);
@@ -961,13 +961,13 @@ struct audition_model_loader {
 
         // create data context
         size_t mem_size = static_cast<size_t>(gguf_get_n_tensors(ctx_gguf.get()) + 1) * ggml_tensor_overhead();
-        
+
         // 为自定义whisper encoder分配更多内存
         if (model.model_type == MiniCPM_o) {
             mem_size *= 4; // 增加4倍内存以适应大型whisper模型
             LOG_INF("%s: Custom whisper encoder detected, increasing memory pool size to %zu bytes\n", __func__, mem_size);
         }
-        
+
         struct ggml_init_params params = {
             /*.mem_size =*/ mem_size,
             /*.mem_buffer =*/ NULL,
@@ -1062,28 +1062,28 @@ struct audition_model_loader {
 
         // load whisper encoder (649-693)
         model.whisper_e_pe = get_whisper_tensor("encoder.positional_embedding");
-        
+
         // conv layers
         model.whisper_e_conv_1_w = get_whisper_tensor("encoder.conv1.weight");
         model.whisper_e_conv_1_b = get_whisper_tensor("encoder.conv1.bias");
         model.whisper_e_conv_2_w = get_whisper_tensor("encoder.conv2.weight");
         model.whisper_e_conv_2_b = get_whisper_tensor("encoder.conv2.bias");
-        
+
         // last layer norm
         model.whisper_e_ln_w = get_whisper_tensor("encoder.ln_post.weight");
         model.whisper_e_ln_b = get_whisper_tensor("encoder.ln_post.bias");
-        
+
         // load encoder layers (660-685)
         const int n_layer = hparams.n_layer;
         model.whisper_layers.resize(n_layer);
         for (int i = 0; i < n_layer; ++i) {
             auto & layer = model.whisper_layers[i];
             std::string prefix = "encoder.blocks." + std::to_string(i) + ".";
-            
+
             // attention layer norm
             layer.attn_ln_0_w = get_whisper_tensor(prefix + "attn_ln.weight");
             layer.attn_ln_0_b = get_whisper_tensor(prefix + "attn_ln.bias");
-            
+
             // attention weights
             layer.attn_q_w = get_whisper_tensor(prefix + "attn.query.weight");
             layer.attn_q_b = get_whisper_tensor(prefix + "attn.query.bias");
@@ -1091,28 +1091,28 @@ struct audition_model_loader {
             // 注意：key没有bias（参考whisper_encoder.cpp:678行）
             layer.attn_v_w = get_whisper_tensor(prefix + "attn.value.weight");
             layer.attn_v_b = get_whisper_tensor(prefix + "attn.value.bias");
-            
+
             // attention output projection
             layer.attn_ln_1_w = get_whisper_tensor(prefix + "attn.out.weight");
             layer.attn_ln_1_b = get_whisper_tensor(prefix + "attn.out.bias");
-            
+
             // MLP layer norm
             layer.mlp_ln_w = get_whisper_tensor(prefix + "mlp_ln.weight");
             layer.mlp_ln_b = get_whisper_tensor(prefix + "mlp_ln.bias");
-            
+
             // MLP weights
             layer.mlp_0_w = get_whisper_tensor(prefix + "mlp.0.weight");
             layer.mlp_0_b = get_whisper_tensor(prefix + "mlp.0.bias");
             layer.mlp_1_w = get_whisper_tensor(prefix + "mlp.2.weight");
             layer.mlp_1_b = get_whisper_tensor(prefix + "mlp.2.bias");
         }
-        
+
         // load audio projector (687-691)
         model.whisper_proj_1_w = get_whisper_tensor("audio_projector.linear1.weight");
         model.whisper_proj_1_b = get_whisper_tensor("audio_projector.linear1.bias");
         model.whisper_proj_2_w = get_whisper_tensor("audio_projector.linear2.weight");
         model.whisper_proj_2_b = get_whisper_tensor("audio_projector.linear2.bias");
-        
+
         // load mel filters (622-633)
         {
             int idx_flt_data = -1;
@@ -1123,22 +1123,22 @@ struct audition_model_loader {
                     break;
                 }
             }
-            
+
             if (idx_flt_data >= 0) {
                 const float* filter_data_addr = (const float*)gguf_get_arr_data(ctx_gguf.get(), idx_flt_data);
                 int n_flts = hparams.n_mel_bins * hparams.n_fft;
                 model.whisper_filters_data.resize(n_flts);
                 std::memcpy(model.whisper_filters_data.data(), filter_data_addr, n_flts * sizeof(float));
-                LOG_INF("%s: Loaded mel filters: %d mel bins x %d fft bins = %d elements\n", 
+                LOG_INF("%s: Loaded mel filters: %d mel bins x %d fft bins = %d elements\n",
                         __func__, hparams.n_mel_bins, hparams.n_fft, n_flts);
             } else {
                 LOG_ERR("%s: Failed to find 'filters' in GGUF metadata\n", __func__);
                 throw std::runtime_error("Missing mel filters data in model file");
             }
         }
-        
+
         LOG_INF("%s: Successfully loaded %d whisper encoder layers, projector and mel filters\n", __func__, n_layer);
-        
+
         // Step 5: initialize whisper KV cache
         // n_audio_ctx = 1500
         const int n_audio_ctx = hparams.n_ctx;
@@ -1275,7 +1275,7 @@ struct audition_ctx * audition_init(const char * fname, struct audition_context_
     audition_ctx * ctx_audio = nullptr;
 
     LOG_INF("%s: initializing audition model from '%s'\n", __func__, fname);
-    
+
     try {
         LOG_INF("%s: creating model loader...\n", __func__);
         audition_model_loader loader(fname);
@@ -1338,13 +1338,13 @@ void audition_audio_f32_batch_free(struct audition_audio_f32_batch * batch) { if
 
 whisper_preprocessor::whisper_filters audition_get_mel_filters(const struct audition_ctx * ctx) {
     whisper_preprocessor::whisper_filters filters;
-    
+
     if (ctx->model.model_type == MiniCPM_o && !ctx->model.whisper_filters_data.empty()) {
         filters.n_mel = ctx->model.hparams.n_mel_bins;
         filters.n_fft = ctx->model.hparams.n_fft;
         filters.data = ctx->model.whisper_filters_data;
-        
-        LOG_INF("%s: Retrieved mel filters from model: %d mel bins x %d fft bins\n", 
+
+        LOG_INF("%s: Retrieved mel filters from model: %d mel bins x %d fft bins\n",
                 __func__, filters.n_mel, filters.n_fft);
     } else {
         LOG_ERR("%s: No mel filters data available in model\n", __func__);
@@ -1352,7 +1352,7 @@ whisper_preprocessor::whisper_filters audition_get_mel_filters(const struct audi
         filters.n_mel = 0;
         filters.n_fft = 0;
     }
-    
+
     return filters;
 }
 
@@ -1414,7 +1414,7 @@ bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const 
     if (batch_size != 1) {
         return false; // only support batch size of 1
     }
-    
+
     // 阶段4：如果是音频且未启用流式模式，自动清空 KV cache
     if (audios.is_audio && !ctx->whisper_streaming_mode) {
         if (ctx->whisper_kv_cache.buffer != nullptr && ctx->whisper_kv_cache.iter > 0) {
@@ -1422,7 +1422,7 @@ bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const 
             audition_whisper_clear_kv_cache(ctx);
         }
     }
-    
+
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = audition_audio_build_graph(ctx, audios);
     ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
@@ -1474,10 +1474,10 @@ bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const 
         const auto & mel_inp = audios.entries[0];
         const int n_step = mel_inp->nx;
         const int n_mel  = mel_inp->ny;
-        
-        LOG_INF("%s: Audio input data - n_step=%d, n_mel=%d, total_elements=%d\n", 
+
+        LOG_INF("%s: Audio input data - n_step=%d, n_mel=%d, total_elements=%d\n",
                 __func__, n_step, n_mel, n_step * n_mel);
-        
+
         std::vector<float> inp_raw(n_step * n_mel);
         std::memcpy(inp_raw.data(), mel_inp->buf.data(), n_step * n_mel * sizeof(float));
         set_input_f32("inp_raw", inp_raw);
@@ -1508,7 +1508,7 @@ bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const 
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
     }
-    
+
     // 阶段5：主图执行后，增加 KV cache 的 iter 计数
     // KV cache 写入已经在图中直接完成（通过 ggml_cpy）
     if (audios.is_audio && ctx->whisper_kv_cache.buffer != nullptr) {
@@ -1519,14 +1519,14 @@ bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const 
         // Note: pooling happens later in projector, so n_tokens here is before pooling
         const int input_frames = audios.entries[0]->nx;
         const int n_tokens = input_frames / 2; // After conv2 with stride=2
-        
+
         const int current_total_tokens = ctx->whisper_kv_cache.iter * n_tokens;
         const int new_total_tokens = current_total_tokens + n_tokens;
         const int max_tokens = ctx->whisper_kv_cache.size;
-        
+
         LOG_INF("%s: Before incrementing iter: input_frames=%d, n_tokens=%d, current_iter=%d, current_total=%d, new_total=%d, max_tokens=%d\n",
                 __func__, input_frames, n_tokens, ctx->whisper_kv_cache.iter, current_total_tokens, new_total_tokens, max_tokens);
-        
+
         if (new_total_tokens > max_tokens) {
             LOG_ERR("%s: FATAL - Cannot increment iter: would exceed cache size! current_total=%d, new_total=%d, max_tokens=%d\n",
                     __func__, current_total_tokens, new_total_tokens, max_tokens);
@@ -1536,35 +1536,35 @@ bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const 
             ctx->whisper_kv_cache.iter = 0;
         } else {
             ctx->whisper_kv_cache.iter++;
-            LOG_INF("%s: KV cache iter incremented to %d (total_tokens=%d, max_tokens=%d)\n", 
+            LOG_INF("%s: KV cache iter incremented to %d (total_tokens=%d, max_tokens=%d)\n",
                     __func__, ctx->whisper_kv_cache.iter, new_total_tokens, max_tokens);
         }
     }
 
     // the last node is the final output (after projector + pooling)
     ggml_tensor * final_out = ggml_graph_node(gf, -1);
-    
+
     // Get output shape: [n_embd, n_tokens]
     const int n_embd = final_out->ne[0];
     const int n_tokens_out = final_out->ne[1];
-    
+
     LOG_INF("%s: Final output shape: [%d, %d]\n", __func__, n_embd, n_tokens_out);
-    
+
     // Copy output to vec
     ggml_backend_tensor_get(final_out, vec, 0, ggml_nbytes(final_out));
 
     // sanity check (only support batch size of 1 for now)
     const int expected_n_tokens_out = audition_n_output_tokens(ctx, audios.entries[0].get());
     if (n_tokens_out != expected_n_tokens_out) {
-        LOG_ERR("%s: expected output %d tokens, got %d\n", 
+        LOG_ERR("%s: expected output %d tokens, got %d\n",
                 __func__, expected_n_tokens_out, n_tokens_out);
-        
+
         // 🔧 [安全检查] 如果输出 0 tokens，返回 false 而不是 abort
         if (n_tokens_out == 0) {
             LOG_WRN("%s: audio encoding produced 0 tokens, returning false\n", __func__);
             return false;
         }
-        
+
         // 🔧 [修复] 由于 pooling 边界的舍入误差，允许 ±1 token 的差异
         // 这种情况在处理非整数秒的音频时很常见
         const int diff = abs(n_tokens_out - expected_n_tokens_out);
@@ -1579,7 +1579,7 @@ bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const 
             GGML_ABORT("Invalid number of output tokens");
         }
     }
-    
+
     LOG_INF("%s: Final output: %d tokens x %d dims\n", __func__, n_tokens_out, n_embd);
 
     return true;
@@ -1600,44 +1600,44 @@ bool audition_audio_encode(struct audition_ctx * ctx, const int n_threads, audit
 //
 void audition_whisper_init_kv_cache(struct audition_ctx * ctx, int n_state, int n_layer, int n_audio_ctx) {
     auto & kv_cache = ctx->whisper_kv_cache;
-    
+
     // Store parameters
     kv_cache.n_layer = n_layer;
     kv_cache.size = n_audio_ctx;
     kv_cache.iter = 0;
-    
+
     // Create ggml context for KV cache tensors
     struct ggml_init_params params = {
         /*.mem_size   =*/ size_t(2u * n_layer * ggml_tensor_overhead()),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
-    
+
     kv_cache.ctx = ggml_init(params);
     if (!kv_cache.ctx) {
         LOG_ERR("%s: failed to allocate ggml context for KV cache\n", __func__);
         return;
     }
-    
+
     // Allocate K and V tensors for each layer
     // K cache: [n_state, n_audio_ctx] for each layer
     // V cache: [n_audio_ctx, n_state] for each layer (transposed for efficient access)
     kv_cache.k_l.reserve(n_layer);
     kv_cache.v_l.reserve(n_layer);
-    
+
     const ggml_type kv_type = GGML_TYPE_F16;  // Use F16 for KV cache to save memory
-    
+
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * k = ggml_new_tensor_1d(kv_cache.ctx, kv_type, n_state * n_audio_ctx);
         ggml_tensor * v = ggml_new_tensor_1d(kv_cache.ctx, kv_type, n_state * n_audio_ctx);
-        
+
         ggml_format_name(k, "cache_k_l%d", il);
         ggml_format_name(v, "cache_v_l%d", il);
-        
+
         kv_cache.k_l.push_back(k);
         kv_cache.v_l.push_back(v);
     }
-    
+
     // Allocate backend buffer for KV cache
     kv_cache.buffer = ggml_backend_alloc_ctx_tensors(kv_cache.ctx, ctx->backend);
     if (!kv_cache.buffer) {
@@ -1646,10 +1646,10 @@ void audition_whisper_init_kv_cache(struct audition_ctx * ctx, int n_state, int 
         kv_cache.ctx = nullptr;
         return;
     }
-    
+
     // Clear the cache
     ggml_backend_buffer_clear(kv_cache.buffer, 0);
-    
+
     LOG_INF("%s: KV cache initialized - n_layer=%d, n_state=%d, n_audio_ctx=%d, buffer_size=%.2f MB\n",
             __func__, n_layer, n_state, n_audio_ctx,
             ggml_backend_buffer_get_size(kv_cache.buffer) / (1024.0 * 1024.0));
@@ -1657,35 +1657,35 @@ void audition_whisper_init_kv_cache(struct audition_ctx * ctx, int n_state, int 
 
 void audition_whisper_free_kv_cache(struct audition_ctx * ctx) {
     auto & kv_cache = ctx->whisper_kv_cache;
-    
+
     if (kv_cache.buffer) {
         ggml_backend_buffer_free(kv_cache.buffer);
         kv_cache.buffer = nullptr;
     }
-    
+
     if (kv_cache.ctx) {
         ggml_free(kv_cache.ctx);
         kv_cache.ctx = nullptr;
     }
-    
+
     kv_cache.k_l.clear();
     kv_cache.v_l.clear();
     kv_cache.n_layer = 0;
     kv_cache.size = 0;
     kv_cache.iter = 0;
-    
+
     LOG_INF("%s: KV cache freed\n", __func__);
 }
 
 void audition_whisper_clear_kv_cache(struct audition_ctx * ctx) {
     auto & kv_cache = ctx->whisper_kv_cache;
-    
+
     if (kv_cache.buffer) {
         ggml_backend_buffer_clear(kv_cache.buffer, 0);
     }
-    
+
     kv_cache.iter = 0;
-    
+
     LOG_INF("%s: KV cache cleared\n", __func__);
 }
 
@@ -1987,7 +1987,7 @@ bool preprocess_audio(
     }
 
     output.push_back(std::move(out_full));
-    
+
     return true;
 }
 
@@ -2035,11 +2035,11 @@ bool audition_audio_preprocess(
     // ===== 步骤1：解码音频 =====
     std::vector<float> pcm_f32;
     int sample_rate = 16000;
-    
+
     bool decode_ok = decode_audio_from_buf(
-        audio_data, 
-        audio_data_len, 
-        sample_rate, 
+        audio_data,
+        audio_data_len,
+        sample_rate,
         pcm_f32
     );
 
@@ -2047,10 +2047,10 @@ bool audition_audio_preprocess(
         LOG_ERR("%s: Failed to decode audio data\n", __func__);
         return false;
     }
-    
+
     LOG_INF("%s: Decoded audio - sample_rate=%d, n_samples=%zu\n",
             __func__, sample_rate, pcm_f32.size());
-    
+
     // 🔧 [修复] 将音频 pad 到 100ms 的倍数（1600 samples @ 16kHz）
     // 这是为了确保 Whisper encoder 的输出 token 数与预期一致
     // 原因：
@@ -2059,11 +2059,11 @@ bool audition_audio_preprocess(
     //   - pool (k=5, s=5)：(mel_frames/2 - 5) / 5 + 1
     //   - 只有当 mel_frames 是 10 的倍数时，token 数才能精确计算
     //   - mel_frames = 10 对应 n_samples = 1600 (100ms)
-    // 
+    //
     // 尾音处理：流式音频的最后一片可能不足 100ms 的倍数，需要 pad 静音
     const size_t CHUNK_SAMPLES = 1600;  // 100ms @ 16kHz
     size_t original_size = pcm_f32.size();
-    
+
     if (original_size < CHUNK_SAMPLES) {
         // 太短，pad 到最小 100ms
         pcm_f32.resize(CHUNK_SAMPLES, 0.0f);
@@ -2074,52 +2074,52 @@ bool audition_audio_preprocess(
         size_t padded_size = ((original_size / CHUNK_SAMPLES) + 1) * CHUNK_SAMPLES;
         pcm_f32.resize(padded_size, 0.0f);
         LOG_WRN("%s: Audio not aligned to 100ms (%zu samples = %.1fms), padded with silence to %zu samples (%.0fms)\n",
-                __func__, original_size, original_size * 1000.0f / sample_rate, 
+                __func__, original_size, original_size * 1000.0f / sample_rate,
                 padded_size, padded_size * 1000.0f / sample_rate);
     }
-    
+
     // ===== 步骤2：获取 Mel 滤波器 =====
     whisper_preprocessor::whisper_filters filters = audition_get_mel_filters(ctx);
-    
+
     if (filters.n_mel == 0 || filters.n_fft == 0) {
         LOG_ERR("%s: Mel filters not available in model\n", __func__);
         return false;
     }
-    
+
     LOG_INF("%s: Using mel filters - n_mel=%d, n_fft=%d\n",
             __func__, filters.n_mel, filters.n_fft);
-    
+
     // ===== 步骤3：生成 Mel 频谱 =====
     std::vector<whisper_preprocessor::whisper_mel> mel_spec_chunks;
-    
+
     bool preprocess_ok = whisper_preprocessor::preprocess_audio(
         pcm_f32.data(),
         pcm_f32.size(),
         filters,
         mel_spec_chunks
     );
-    
+
     if (!preprocess_ok || mel_spec_chunks.empty()) {
         LOG_ERR("%s: Failed to generate mel spectrogram\n", __func__);
         return false;
     }
-    
+
     LOG_INF("%s: Generated %zu mel spectrogram chunk(s)\n",
             __func__, mel_spec_chunks.size());
-    
+
     // ===== 步骤4：封装为 audition_audio_f32 =====
     // 1s -> 100 frames -> 50 tokens -> 1 chunk
     auto & mel_spec = mel_spec_chunks[0];
-    
+
     audition_audio_f32 * mel_f32 = audition_audio_f32_init();
     mel_f32->nx = mel_spec.n_len;   // 时间维度（frames）
     mel_f32->ny = mel_spec.n_mel;   // Mel bins 数量
     mel_f32->buf = std::move(mel_spec.data);  // 移动数据避免拷贝
-    
+
     *out_mel = mel_f32;
-    
+
     LOG_INF("%s: Mel spectrogram ready - n_len=%d, n_mel=%d, total_size=%zu\n",
             __func__, mel_f32->nx, mel_f32->ny, mel_f32->buf.size());
-    
+
     return true;
 }

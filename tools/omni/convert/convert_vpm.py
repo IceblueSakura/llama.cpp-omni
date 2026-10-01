@@ -619,7 +619,7 @@ else:
     elif minicpmv_version == 100045:
         emb_dim = 4096
         block_count = 27
-        
+
     default_vision_config = {
             "hidden_size": 1152,
             "image_size": 980,

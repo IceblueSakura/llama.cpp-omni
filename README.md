@@ -48,7 +48,7 @@ The core runtime pipeline of llama.cpp-omni consists of three stages:
 
 1. **Initialization (omni_init)**: Loads all GGUF models, initializes LLM/TTS/Token2Wav contexts, and configures simplex/duplex mode along with reference audio (for voice cloning).
 
-2. **Streaming Prefill (stream_prefill)**: 
+2. **Streaming Prefill (stream_prefill)**:
    - When `index=0`: Initializes System Prompt, including text system prompt and audio system prompt (reference audio embedding)
    - When `index>0`: Processes user input — audio is encoded via APM, images via VPM, and embeddings are fed into LLM prefill
    - Supports high-resolution mode (max_slice_nums=2) and high-FPS mode (main image + stacked images)

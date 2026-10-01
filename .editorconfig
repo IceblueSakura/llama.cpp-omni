@@ -45,6 +45,15 @@ insert_final_newline = unset
 trim_trailing_whitespace = unset
 insert_final_newline = unset
 
+# Like the active UI, the legacy UI delegates mixed JS/Svelte indentation to Prettier.
+[tools/server/webui/**]
+indent_style = unset
+indent_size = unset
+
+# Embedded Markdown examples contain intentional indentation and hard line breaks.
+[tools/server/webui/src/stories/fixtures/*.ts]
+trim_trailing_whitespace = unset
+
 [tools/ui/**]
 indent_style = unset
 indent_size = unset

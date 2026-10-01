@@ -2254,7 +2254,7 @@ bool fmFlowMatchingGGUFModelLoader::init_backend(const std::string & device) {
     if (device.find("gpu") == 0) {
         int gpu_idx = parse_gpu_index(device);
         backend_ = fm_loader_init_backend_gpu_idx(gpu_idx, backend_name_);
-        std::fprintf(stderr, "fmFlowMatchingGGUFModelLoader: init_backend device=%s, gpu_idx=%d, backend=%s\n", 
+        std::fprintf(stderr, "fmFlowMatchingGGUFModelLoader: init_backend device=%s, gpu_idx=%d, backend=%s\n",
                 device.c_str(), gpu_idx, backend_name_.c_str());
     } else {
         backend_ = fm_loader_init_backend_cpu(backend_name_);
@@ -7800,7 +7800,7 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         ggml_build_forward_expand(sess_->gf_last, cpy_est_cnn_2);
         ggml_build_forward_expand(sess_->gf_last, cpy_est_att_2);
 
-        
+
         ggml_cgraph * gf_alloc = ggml_new_graph_custom(sess_->ctx, GGML_DEFAULT_GRAPH_SIZE * 1024, false);
         ggml_build_forward_expand(gf_alloc, cpy_conf_cnn);
         ggml_build_forward_expand(gf_alloc, cpy_conf_att);

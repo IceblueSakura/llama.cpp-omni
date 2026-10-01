@@ -5698,7 +5698,7 @@ int main(int argc, char ** argv) {
                 ctx_server.octx->text_done_flag = false;
                 ctx_server.octx->text_streaming = true;
             }
-            
+
             // start decode in a background thread so we can stream text concurrently
             std::thread worker([&ctx_server, debug_dir, round_idx]() {
                 std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
@@ -5714,7 +5714,7 @@ int main(int argc, char ** argv) {
                     std::string frag = std::move(ctx_server.octx->text_queue.front());
                     ctx_server.octx->text_queue.pop_front();
                     lk.unlock();
-                    
+
                     // 🔧 [P1-SSE响应] 处理特殊状态消息和普通文本
                     json ev;
                     if (frag == "__IS_LISTEN__") {
@@ -5742,7 +5742,7 @@ int main(int argc, char ** argv) {
                             {"end_of_turn", false}
                     };
                     }
-                    
+
                     if (!server_sent_event(sink, ev)) {
                         if (worker.joinable()) worker.join();
                         return false; // client closed
@@ -5786,22 +5786,22 @@ int main(int argc, char ** argv) {
         }
         bool use_tts = json_value(data, "use_tts", true);
         bool duplex_mode = json_value(data, "duplex_mode", false);
-        
+
         // 模型目录配置
         std::string model_dir = json_value(data, "model_dir", std::string("./tools/omni/convert/gguf/"));
         std::string tts_bin_dir = json_value(data, "tts_bin_dir", model_dir + "token2wav-gguf");
-        
+
         // GPU 配置
         int tts_gpu_layers = json_value(data, "tts_gpu_layers", 99);
         std::string token2wav_device = json_value(data, "token2wav_device", std::string("gpu:1"));
-        
+
         // 🔧 [多实例支持] 可配置的输出目录
         std::string output_dir = json_value(data, "output_dir", std::string("./tools/omni/output"));
-        
+
         // 生成限制 - 防止无限循环
         int n_predict = json_value(data, "n_predict", 2048);
         params.n_predict = n_predict;
-        
+
         // 设置模型路径
         // 确保 model_dir 末尾有斜杠
         std::string model_dir_normalized = model_dir;
@@ -5814,7 +5814,7 @@ int main(int argc, char ** argv) {
         params.tts_model = model_dir_normalized + "tts/MiniCPM-o-4_5-tts-F16.gguf";
         // LLM 模型路径由 llama-server 启动时的 --model 参数指定，这里不需要设置
         // params.model.path 已经由 ctx_server.model 提供
-        
+
         // 视觉编码器后端: "metal"(默认GPU) 或 "coreml"(ANE加速)
         std::string vision_backend = json_value(data, "vision_backend", std::string("metal"));
         if (vision_backend == "coreml") {
@@ -5921,7 +5921,7 @@ int main(int argc, char ** argv) {
     const auto handle_stream_break_impl = [&ctx_server, &res_ok, &res_error](const json & data, httplib::Response & res) -> void {
         // Expected body fields:
         //   reason: string (optional) - 打断原因，用于日志
-        // 
+        //
         // 打断机制：
         //   1. 设置 break_event = true，通知 LLM/TTS 线程停止生成
         //   2. 清空 text_queue (文本流队列)
@@ -5929,24 +5929,24 @@ int main(int argc, char ** argv) {
         //   4. TTS/T2W 队列由各自线程检测 break_event 后自行清理
         //
         // 注意：打断后需要重新调用 prefill 来开始新的输入
-        
+
         {
             std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
             if (ctx_server.octx == nullptr) {
                 res_error(res, format_error_response("omni context not initialized. call /v1/stream/omni_init first", ERROR_TYPE_INVALID_REQUEST));
                 return;
             }
-            
-            std::string reason = data.contains("reason") && data.at("reason").is_string() 
-                                 ? data.at("reason").get<std::string>() 
+
+            std::string reason = data.contains("reason") && data.at("reason").is_string()
+                                 ? data.at("reason").get<std::string>()
                                  : "user_interrupt";
-            
+
             SRV_INF("%s: break requested, reason=%s\n", __func__, reason.c_str());
-            
+
             // 1. 设置打断标志 - 原子操作，线程安全
             ctx_server.octx->break_event = true;
             ctx_server.octx->current_turn_ended = true;
-            
+
             // 2. 清空 text_queue 并通知等待的消费者
             {
                 std::lock_guard<std::mutex> text_lock(ctx_server.octx->text_mtx);
@@ -5954,21 +5954,21 @@ int main(int argc, char ** argv) {
                 ctx_server.octx->text_done_flag = true;  // 标记文本生成结束
             }
             ctx_server.octx->text_cv.notify_all();
-            
+
             // 3. TTS/T2W 队列清理：通过 break_event 标志通知线程自行处理
             //    各线程在下一次循环时检测 break_event 并清理自己的队列
             //    这避免了跨编译单元访问不完整类型的问题
-            
+
             SRV_INF("%s: break completed, break_event=true, text_queue cleared\n", __func__);
         }
-        
+
         json ack = {
             {"success", true},
             {"message", "generation interrupted"}
         };
         res_ok(res, ack);
     };
-    
+
     const auto handle_stream_break = [&handle_stream_break_impl](const httplib::Request & req, httplib::Response & res) {
         SRV_INF("%s: handle_stream_break\n", __func__);
         json body = req.body.empty() ? json::object() : json::parse(req.body);
@@ -5980,7 +5980,7 @@ int main(int argc, char ** argv) {
     const auto handle_stream_reset_impl = [&ctx_server, &res_ok, &res_error](const json & data, httplib::Response & res) -> void {
         // Expected body fields:
         //   - duplex_mode: (optional) bool - 更新双工/单工模式
-        // 
+        //
         // 重置机制：
         //   1. 清空 LLM 的 KV cache
         //   2. 清空 TTS 的 KV cache
@@ -5988,16 +5988,16 @@ int main(int argc, char ** argv) {
         //   4. 更新 duplex_mode（如果提供）
         //
         // 用途：每次 init_sys_prompt 时调用，确保新会话从干净状态开始
-        
+
         {
             std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
             if (ctx_server.octx == nullptr) {
                 res_error(res, format_error_response("omni context not initialized. call /v1/stream/omni_init first", ERROR_TYPE_INVALID_REQUEST));
                 return;
             }
-            
+
             SRV_INF("%s: reset requested, clearing KV caches\n", __func__);
-            
+
             // 1. 清空 LLM KV cache
             if (ctx_server.octx->ctx_llama) {
                 llama_memory_t mem = llama_get_memory(ctx_server.octx->ctx_llama);
@@ -6006,7 +6006,7 @@ int main(int argc, char ** argv) {
                     SRV_INF("%s: LLM KV cache cleared\n", __func__);
                 }
             }
-            
+
             // 2. 清空 TTS KV cache
             if (ctx_server.octx->ctx_tts_llama) {
                 llama_memory_t tts_mem = llama_get_memory(ctx_server.octx->ctx_tts_llama);
@@ -6015,41 +6015,41 @@ int main(int argc, char ** argv) {
                     SRV_INF("%s: TTS KV cache cleared\n", __func__);
                 }
             }
-            
+
             // 3. 重置状态变量
             ctx_server.octx->n_past = 0;
             ctx_server.octx->tts_all_generated_tokens.clear();
             ctx_server.octx->break_event = false;
             ctx_server.octx->current_turn_ended = false;
             ctx_server.octx->llm_generation_done = false;
-            
+
             // 🔧 [修复卡住问题] 重置 speek_done 为 true
             // 原因：stream_prefill(index=0) 在 warmup_done=true 时会等待 speek_done=true
             // 如果会话重置时不设置 speek_done=true，下次 prefill 会卡住等待 30 秒超时
             ctx_server.octx->speek_done = true;
             SRV_INF("%s: speek_done set to true for new session\n", __func__);
-            
+
             // 4. 🔧 [优化] 更新 duplex_mode（如果提供）
             // duplex_mode 只影响 TTS 运行时行为，不需要重新加载模型
             if (data.contains("duplex_mode")) {
                 bool new_duplex_mode = data.at("duplex_mode").get<bool>();
                 if (ctx_server.octx->duplex_mode != new_duplex_mode) {
-                    SRV_INF("%s: duplex_mode changed from %d to %d\n", __func__, 
+                    SRV_INF("%s: duplex_mode changed from %d to %d\n", __func__,
                             ctx_server.octx->duplex_mode, new_duplex_mode);
                     ctx_server.octx->duplex_mode = new_duplex_mode;
                 }
             }
-            
+
             SRV_INF("%s: reset completed\n", __func__);
         }
-        
+
         json ack = {
             {"success", true},
             {"message", "KV caches cleared, ready for new session"}
         };
         res_ok(res, ack);
     };
-    
+
     const auto handle_stream_reset = [&handle_stream_reset_impl](const httplib::Request & req, httplib::Response & res) {
         SRV_INF("%s: handle_stream_reset\n", __func__);
         json body = req.body.empty() ? json::object() : json::parse(req.body);
@@ -6063,7 +6063,7 @@ int main(int argc, char ** argv) {
         //   - media_type: (optional) int - 1=audio, 2=omni
         //   - duplex_mode: (optional) bool - 双工/单工模式
         //   - voice_audio: (optional) string - 音色参考音频路径
-        // 
+        //
         // 功能：
         //   1. 更新 media_type（影响 system prompt）
         //   2. 更新 duplex_mode
@@ -6071,41 +6071,41 @@ int main(int argc, char ** argv) {
         //   4. 重新 prefill system prompt（如果提供 voice_audio）
         //
         // 注意：不重新加载模型，只更新运行时配置
-        
+
         {
             std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
             if (ctx_server.octx == nullptr) {
                 res_error(res, format_error_response("omni context not initialized. call /v1/stream/omni_init first", ERROR_TYPE_INVALID_REQUEST));
                 return;
             }
-            
+
             SRV_INF("%s: update_session_config requested\n", __func__);
-            
+
             // 1. 更新 media_type（如果提供）
             bool media_type_changed = false;
             int old_media_type = ctx_server.octx->media_type;
             if (data.contains("media_type")) {
                 int new_media_type = data.at("media_type").get<int>();
                 if (ctx_server.octx->media_type != new_media_type) {
-                    SRV_INF("%s: media_type changed from %d to %d\n", __func__, 
+                    SRV_INF("%s: media_type changed from %d to %d\n", __func__,
                             ctx_server.octx->media_type, new_media_type);
                     ctx_server.octx->media_type = new_media_type;
                     media_type_changed = true;
                 }
             }
-            
+
             // 2. 更新 duplex_mode（如果提供）
             bool duplex_mode_changed = false;
             if (data.contains("duplex_mode")) {
                 bool new_duplex_mode = data.at("duplex_mode").get<bool>();
                 if (ctx_server.octx->duplex_mode != new_duplex_mode) {
-                    SRV_INF("%s: duplex_mode changed from %d to %d\n", __func__, 
+                    SRV_INF("%s: duplex_mode changed from %d to %d\n", __func__,
                             ctx_server.octx->duplex_mode, new_duplex_mode);
                     ctx_server.octx->duplex_mode = new_duplex_mode;
                     duplex_mode_changed = true;
                 }
             }
-            
+
             // 🔧 [#39 滑动窗口] 更新滑窗配置（如果提供）
             if (data.contains("sliding_window_mode")) {
                 std::string new_mode = data.at("sliding_window_mode").get<std::string>();
@@ -6125,7 +6125,7 @@ int main(int argc, char ** argv) {
                         ctx_server.octx->sliding_window_config.low_water_tokens, low_water);
                 ctx_server.octx->sliding_window_config.low_water_tokens = low_water;
             }
-            
+
             // 🔧 [高清模式] 更新 highImage 配置
             if (data.contains("highImage")) {
                 bool new_high_image = data.at("highImage").get<bool>();
@@ -6133,7 +6133,7 @@ int main(int argc, char ** argv) {
                     SRV_INF("%s: highImage changed from %d to %d\n", __func__,
                             ctx_server.octx->high_image, new_high_image);
                     ctx_server.octx->high_image = new_high_image;
-                    
+
                     // 设置 vision max_slice_nums: 高清模式为 2，普通模式为 -1（使用模型默认）
                     if (ctx_server.octx->ctx_vision) {
                         int max_slice_nums = new_high_image ? 2 : -1;
@@ -6141,7 +6141,7 @@ int main(int argc, char ** argv) {
                     }
                 }
             }
-            
+
             // 🔧 [高刷模式] 更新 highRefresh 配置
             // 注意：stack 处理在 Python server 层实现，C++ 只是标记
             if (data.contains("highRefresh")) {
@@ -6152,7 +6152,7 @@ int main(int argc, char ** argv) {
                     ctx_server.octx->high_refresh = new_high_refresh;
                 }
             }
-            
+
             // 3. 清空 KV cache
             if (ctx_server.octx->ctx_llama) {
                 llama_memory_t mem = llama_get_memory(ctx_server.octx->ctx_llama);
@@ -6161,7 +6161,7 @@ int main(int argc, char ** argv) {
                     SRV_INF("%s: LLM KV cache cleared\n", __func__);
                 }
             }
-            
+
             if (ctx_server.octx->ctx_tts_llama) {
                 llama_memory_t tts_mem = llama_get_memory(ctx_server.octx->ctx_tts_llama);
                 if (tts_mem) {
@@ -6169,7 +6169,7 @@ int main(int argc, char ** argv) {
                     SRV_INF("%s: TTS KV cache cleared\n", __func__);
                 }
             }
-            
+
             // 4. 重置状态变量
             ctx_server.octx->n_past = 0;
             ctx_server.octx->n_keep = 0;
@@ -6177,7 +6177,7 @@ int main(int argc, char ** argv) {
             ctx_server.octx->break_event = false;
             ctx_server.octx->current_turn_ended = false;
             ctx_server.octx->llm_generation_done = false;
-            
+
             // 🔧 [修复 KV 位置冲突] 重置 simplex_round_idx 和 wav_turn_base
             // 原因：新 session 时 Python 会从 round_idx=0 开始
             // 如果不重置，stream_decode 收到 round_idx=0 但 simplex_round_idx > 0，会导致状态不一致
@@ -6187,13 +6187,13 @@ int main(int argc, char ** argv) {
             // [Case 2 抢答] 新 session 时重置 force_listen 计数器，重新进入开局强制 LISTEN 期
             ctx_server.octx->force_listen_used = 0;
             SRV_INF("%s: simplex_round_idx, wav_turn_base, force_listen_used reset to 0\n", __func__);
-            
+
             // 🔧 [修复卡住问题] 重置 speek_done 为 true
             // 原因：stream_prefill(index=0) 在 warmup_done=true 时会等待 speek_done=true
             // 如果会话配置更新时不设置 speek_done=true，下次 prefill 会卡住等待 30 秒超时
             ctx_server.octx->speek_done = true;
             SRV_INF("%s: speek_done set to true for session config update\n", __func__);
-            
+
             // 外部传入 system prompt（优先于 C++ 内置默认值）
             if (data.contains("voice_clone_prompt") && data.at("voice_clone_prompt").is_string()) {
                 const std::string vcp = data.at("voice_clone_prompt").get<std::string>();
@@ -6210,7 +6210,7 @@ int main(int argc, char ** argv) {
 
             // 重置 system_prompt_initialized，让 stream_prefill 重新评估 system prompt
             ctx_server.octx->system_prompt_initialized = false;
-            
+
             // 5. 重新 prefill system prompt（如果提供 voice_audio）
             bool voice_audio_used = false;
             if (data.contains("voice_audio") && data.at("voice_audio").is_string()) {
@@ -6222,21 +6222,21 @@ int main(int argc, char ** argv) {
                         return;
                     }
                     voice_audio_used = true;
-                    
+
                     // 🔧 [关键] stream_prefill 完成后设置 n_keep，保护 system prompt
                     ctx_server.octx->n_keep = ctx_server.octx->n_past;
-                    
+
                     // 🔧 [修复] stream_prefill(index=0) 会重置 speek_done=false，system prompt prefill 后需恢复
                     ctx_server.octx->speek_done = true;
-                    
-                    SRV_INF("%s: voice_audio prefilled, n_past=%d, n_keep=%d (system prompt protected)\n", __func__, 
+
+                    SRV_INF("%s: voice_audio prefilled, n_past=%d, n_keep=%d (system prompt protected)\n", __func__,
                             ctx_server.octx->n_past, ctx_server.octx->n_keep);
                 }
             }
-            
+
             SRV_INF("%s: update_session_config completed\n", __func__);
         }
-        
+
         json ack = {
             {"success", true},
             {"message", "Session config updated"},
@@ -6252,7 +6252,7 @@ int main(int argc, char ** argv) {
         };
         res_ok(res, ack);
     };
-    
+
     const auto handle_stream_update_session_config = [&handle_stream_update_session_config_impl](const httplib::Request & req, httplib::Response & res) {
         SRV_INF("%s: handle_stream_update_session_config\n", __func__);
         json body = req.body.empty() ? json::object() : json::parse(req.body);
@@ -6644,7 +6644,7 @@ int main(int argc, char ** argv) {
     // LoRA adapters hotswap
     svr->Get (params.api_prefix + "/lora-adapters",       handle_lora_adapters_list);
     svr->Post(params.api_prefix + "/lora-adapters",       handle_lora_adapters_apply);
-    // Streaming 
+    // Streaming
     svr->Post(params.api_prefix + "/v1/stream/prefill",   handle_stream_prefill);
     svr->Post(params.api_prefix + "/v1/stream/decode",    handle_stream_decode);
     svr->Post(params.api_prefix + "/v1/stream/omni_init", handle_stream_omni_init);
