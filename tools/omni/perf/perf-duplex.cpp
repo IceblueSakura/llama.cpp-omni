@@ -435,7 +435,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__)) || defined(_WIN32)
+#if defined(_WIN32)
+    signal(SIGINT, sigint_handler);
+#elif defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
     struct sigaction sigint_action;
     sigint_action.sa_handler = sigint_handler;
     sigemptyset(&sigint_action.sa_mask);

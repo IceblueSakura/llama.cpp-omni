@@ -17,7 +17,7 @@ WORKDIR /app
 COPY . .
 
 RUN if [ "$TARGETARCH" = "amd64" ] || [ "$TARGETARCH" = "arm64" ]; then \
-        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON; \
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DGGML_BACKEND_DL=OFF -DGGML_CPU_ALL_VARIANTS=OFF; \
     else \
         echo "Unsupported architecture"; \
         exit 1; \
@@ -42,13 +42,13 @@ FROM ubuntu:$UBUNTU_VERSION AS base
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
-ARG IMAGE_URL=https://github.com/ggml-org/llama.cpp
-ARG IMAGE_SOURCE=https://github.com/ggml-org/llama.cpp
+ARG IMAGE_URL=https://github.com/tc-mb/llama.cpp-omni
+ARG IMAGE_SOURCE=https://github.com/tc-mb/llama.cpp-omni
 LABEL org.opencontainers.image.created=$BUILD_DATE \
       org.opencontainers.image.version=$APP_VERSION \
       org.opencontainers.image.revision=$APP_REVISION \
-      org.opencontainers.image.title="llama.cpp" \
-      org.opencontainers.image.description="LLM inference in C/C++" \
+      org.opencontainers.image.title="llama.cpp-omni" \
+      org.opencontainers.image.description="Omni multimodal inference in C/C++" \
       org.opencontainers.image.url=$IMAGE_URL \
       org.opencontainers.image.source=$IMAGE_SOURCE
 
@@ -61,6 +61,7 @@ RUN apt-get update \
     && find /var/cache -type f -delete
 
 COPY --from=build /app/lib/ /app
+ENV LD_LIBRARY_PATH=/app
 
 ### Full
 FROM base AS full
@@ -88,21 +89,22 @@ ENTRYPOINT ["/app/tools.sh"]
 ### Light, CLI only
 FROM base AS light
 
-COPY --from=build /app/full/llama-cli /app/full/llama-completion /app
+COPY --from=build /app/full/llama-omni-cli /app
 
 WORKDIR /app
 
-ENTRYPOINT [ "/app/llama-cli" ]
+ENTRYPOINT [ "/app/llama-omni-cli" ]
 
 ### Server, Server only
 FROM base AS server
 
 ENV LLAMA_ARG_HOST=0.0.0.0
 
-COPY --from=build /app/full/llama-server /app
+# Plain HTTP image; terminate TLS at a reverse proxy when deploying.
+COPY --from=build /app/full/llama-omni-server /app
 
 WORKDIR /app
 
 HEALTHCHECK CMD [ "curl", "-f", "http://localhost:8080/health" ]
 
-ENTRYPOINT [ "/app/llama-server" ]
+ENTRYPOINT [ "/app/llama-omni-server" ]

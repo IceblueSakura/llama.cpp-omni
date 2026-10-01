@@ -89,7 +89,8 @@ if [ ! -z ${GG_BUILD_CUDA} ]; then
 fi
 
 if [ ! -z ${GG_BUILD_ROCM} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_HIP=ON"
+    # Synced from ggml-org/llama.cpp ca2e2037b68ae7d821113d538110e6ce6903864c.
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang -DGGML_HIP=ON"
     if [ -z ${GG_BUILD_AMDGPU_TARGETS} ]; then
         echo "Missing GG_BUILD_AMDGPU_TARGETS, please set it to your GPU architecture (e.g. gfx90a, gfx1100, etc.)"
         exit 1
