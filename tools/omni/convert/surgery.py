@@ -144,6 +144,8 @@ def main():
 
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    if tokenizer is None:
+        raise RuntimeError("AutoTokenizer did not return a tokenizer")
     processor.tokenizer = tokenizer
     model.processor = processor
 

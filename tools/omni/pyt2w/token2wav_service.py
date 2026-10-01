@@ -125,7 +125,8 @@ class Token2WavService:
 
     def set_ref_audio(self, ref_audio_path: str):
         """设置参考音频，初始化流式缓存"""
-        if not self.initialized:
+        token2wav = self.token2wav
+        if not self.initialized or token2wav is None:
             return {"status": "error", "message": "Token2Wav not initialized"}
 
         try:
@@ -145,7 +146,7 @@ class Token2WavService:
                 self.ref_audio_path = ref_audio_path
 
                 # 调用 set_stream_cache 设置缓存
-                self.stream_cache, self.hift_cache = self.token2wav.set_stream_cache(ref_audio_path)
+                self.stream_cache, self.hift_cache = token2wav.set_stream_cache(ref_audio_path)
 
                 # 深拷贝基础缓存，用于后续重置
                 self.stream_cache_base = self._clone_cache(self.stream_cache)
@@ -162,11 +163,11 @@ class Token2WavService:
                 dummy_tokens = [4218, 4218, 4218] + [1000] * 25  # 28 tokens
 
                 # 设置缓存
-                self.token2wav.stream_cache = self._clone_cache(self.stream_cache_base)
-                self.token2wav.hift_cache_dict = self._clone_cache(self.hift_cache_base)
+                token2wav.stream_cache = self._clone_cache(self.stream_cache_base)
+                token2wav.hift_cache_dict = self._clone_cache(self.hift_cache_base)
 
                 # 跑一次推理
-                _ = self.token2wav.stream(
+                _ = token2wav.stream(
                     generated_speech_tokens=dummy_tokens,
                     prompt_wav=ref_audio_path,
                     last_chunk=True,
@@ -206,10 +207,12 @@ class Token2WavService:
 
     def process(self, tokens: list, last_chunk: bool, output_path: str):
         """处理 tokens 并生成 WAV 文件"""
-        if not self.initialized:
+        token2wav = self.token2wav
+        if not self.initialized or token2wav is None:
             return {"status": "error", "message": "Token2Wav not initialized"}
 
-        if self.stream_cache is None:
+        hift_cache = self.hift_cache
+        if self.stream_cache is None or hift_cache is None:
             return {"status": "error", "message": "Reference audio not set"}
 
         try:
@@ -224,11 +227,11 @@ class Token2WavService:
                 start_time = time.time()
 
                 # 设置当前缓存到 token2wav 实例
-                self.token2wav.stream_cache = self.stream_cache
-                self.token2wav.hift_cache_dict = self.hift_cache
+                token2wav.stream_cache = self.stream_cache
+                token2wav.hift_cache_dict = hift_cache
 
                 # 调用流式生成
-                wav_data = self.token2wav.stream(
+                wav_data = token2wav.stream(
                     generated_speech_tokens=tokens,
                     prompt_wav=self.ref_audio_path,
                     last_chunk=last_chunk,
@@ -236,8 +239,8 @@ class Token2WavService:
                 )
 
                 # 更新缓存
-                self.stream_cache = self.token2wav.stream_cache
-                self.hift_cache = self.token2wav.hift_cache_dict
+                self.stream_cache = token2wav.stream_cache
+                self.hift_cache = token2wav.hift_cache_dict
 
                 inference_time = time.time() - start_time
 

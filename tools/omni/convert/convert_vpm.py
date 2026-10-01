@@ -19,6 +19,7 @@
 import os
 import math
 import warnings
+from typing import TypedDict
 
 import numpy as np
 import torch
@@ -35,6 +36,17 @@ from transformers.utils import (
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
+
+
+class VisionConfigValues(TypedDict):
+    hidden_size: int
+    image_size: int
+    intermediate_size: int
+    model_type: str
+    num_attention_heads: int
+    num_hidden_layers: int
+    patch_size: int
+
 
 class SiglipVisionConfig(PretrainedConfig):
     r"""
@@ -567,6 +579,7 @@ if args.use_f32:
 minicpmv_version = args.minicpmv_version
 
 # Use actual config values instead of hardcoded ones
+default_vision_config: VisionConfigValues
 if model_config:
     # For the projector/resampler, use the main model's hidden_size
     emb_dim = model_config.get("hidden_size", 1536)
@@ -630,7 +643,7 @@ else:
             "patch_size": 14,
         }
 
-vision_config = Idefics2VisionConfig(**default_vision_config)
+vision_config = Idefics2VisionConfig.from_dict(dict(default_vision_config))
 model = Idefics2VisionTransformer(vision_config)
 if minicpmv_version == 3 or (model_config and model_config.get("vision_config", {}).get("model_type") == "siglip"):
     vision_config = SiglipVisionConfig(**default_vision_config)
@@ -705,10 +718,10 @@ else:
 if has_vision_encoder:
     # vision_model hparams - use actual config values
     vision_image_size = model_config.get("image_size", 448) if model_config else 448
-    vision_patch_size = default_vision_config.get("patch_size", 14)
-    vision_hidden_size = default_vision_config.get("hidden_size", 1152)
-    vision_intermediate_size = default_vision_config.get("intermediate_size", 4304)
-    vision_attention_heads = default_vision_config.get("num_attention_heads", 16)
+    vision_patch_size = default_vision_config["patch_size"]
+    vision_hidden_size = default_vision_config["hidden_size"]
+    vision_intermediate_size = default_vision_config["intermediate_size"]
+    vision_attention_heads = default_vision_config["num_attention_heads"]
 
     fout.add_uint32("clip.vision.image_size", vision_image_size)
     fout.add_uint32("clip.vision.patch_size", vision_patch_size)

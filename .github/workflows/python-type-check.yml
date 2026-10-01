@@ -1,43 +1,52 @@
 name: Python Type-Check
 
 on:
-  push:
-    paths:
-      - '.github/workflows/python-type-check.yml'
-      - 'ty.toml'
-      - '**.py'
-      - '**/requirements*.txt'
-      # - 'pyrightconfig.json'
-  pull_request:
-    paths:
-      - '.github/workflows/python-type-check.yml'
-      - 'ty.toml'
-      - '**.py'
-      - '**/requirements*.txt'
-      # - 'pyrightconfig.json'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: python-types-${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   python-type-check:
-    runs-on: [self-hosted, fast]
-    name: python type-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    name: Main Python tools
     steps:
-      - name: Check out source repository
-        uses: actions/checkout@v6
-      - name: Set up Python environment
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-python
         with:
-          python-version: "3.11"
-          pip-install: -r requirements/requirements-all.txt ty==0.0.35
-      # - name: Type-check with Pyright
-      #   uses: jakebailey/pyright-action@v2
-      #   with:
-      #     version: 1.1.382
-      #     level: warning
-      #     warnings: true
-      - name: Type-check with ty
+          profile: typecheck
+      - name: Verify imports and CPU tensor ABI
         run: |
-            ty check --output-format=github
+          python -c 'import numpy, torch, gguf, librosa; assert torch.arange(3).numpy().tolist() == [0, 1, 2]'
+      - name: Type-check with ty
+        # Keep existing warning-level diagnostics visible without hiding errors.
+        run: ty check --python .venv --extra-search-path . --exit-zero-on-warning --output-format=github
+      - name: Validate roadmap and regression checks without network writes
+        run: python -m unittest discover -s ci -p 'test_*.py' -v
+
+  token2wav:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    name: Isolated Token2Wav tools
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-python
+      - name: Install isolated frozen dependencies
+        env:
+          UV_PYTHON: '3.12'
+          UV_PYTHON_DOWNLOADS: never
+        run: |
+          uv lock --project tools/omni/pyt2w --check
+          uv sync --project tools/omni/pyt2w --frozen --group ci --extra cpu
+      - name: Verify imports, ABI and type-check the legacy service
+        working-directory: tools/omni/pyt2w
+        run: |
+          uv run --frozen --no-sync python -c 'import torch, torchaudio, numpy; assert torch.arange(3).numpy().tolist() == [0, 1, 2]'
+          uv run --frozen --no-sync ty check . --output-format=github
+          uv run --frozen --no-sync python -m unittest discover -s tests -v

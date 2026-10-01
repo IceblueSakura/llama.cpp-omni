@@ -44,13 +44,6 @@ jobs:
           sudo cp /tmp/git-clang-format /usr/local/bin/git-clang-format
           sudo chmod +x /usr/local/bin/git-clang-format
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: ./.github/actions/setup-python
         with:
-          python-version: '3.11'
-
-      - name: Install Python dependencies
-        run: |
-          python3 -m venv .venv
-          source .venv/bin/activate
-          pip install -r requirements/requirements-all.txt -r tools/server/tests/requirements.txt
+          profile: typecheck

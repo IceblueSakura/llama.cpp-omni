@@ -1149,7 +1149,7 @@ def create_dynamic_model_from_function(func: Callable[..., Any]):
     assert func.__doc__ is not None
     docstring = parse(func.__doc__)
 
-    dynamic_fields = {}
+    dynamic_fields: dict[str, Any] = {}
     param_docs = []
     for param in sig.parameters.values():
         # Exclude 'self' parameter

@@ -101,12 +101,14 @@
 
 # Python
 
-/.venv
+.venv/
 __pycache__/
 */poetry.lock
 poetry.toml
 poetry.lock
 uv.lock
+!/uv.lock
+!/tools/omni/pyt2w/uv.lock
 
 # Nix
 

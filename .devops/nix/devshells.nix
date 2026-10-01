@@ -37,7 +37,7 @@
                     ];
                     # Extra packages that *may* be used by some scripts
                     packages = [
-                        pkgs.python3Packages.tiktoken
+                      pkgs.python3Packages.tiktoken
                     ];
                     shellHook = ''
                       echo "Entering ${name} devShell"
@@ -47,6 +47,22 @@
             }
           ))
           (lib.filterAttrs (name: value: value != null))
-        ];
+        ]
+        // {
+          python-ci = pkgs.mkShell {
+            packages = [
+              pkgs.python312
+              pkgs.uv
+            ];
+            UV_PYTHON = "${pkgs.python312}/bin/python3";
+            UV_PYTHON_DOWNLOADS = "never";
+            # Language packages are supplied by uv, not the Nix interpreter's site-packages.
+            PYTHONPATH = "";
+            LD_LIBRARY_PATH = lib.makeLibraryPath [
+              stdenv.cc.cc
+              pkgs.zlib
+            ];
+          };
+        };
     };
 }

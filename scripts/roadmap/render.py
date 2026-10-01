@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from typing import NoReturn, TypedDict
 
 
 def say(msg: str = "") -> None:
@@ -95,8 +96,41 @@ DIFFICULTY_DESCRIPTION = {
     },
 }
 
+
+class RoadmapStrings(TypedDict):
+    issue_title: str
+    generated: str
+    intro: str
+    claim_heading: str
+    claim_steps: list[str]
+    claim_warning: str
+    claim_recycle: str
+    no_issue_yet: str
+    discord: str
+    difficulty_heading: str
+    difficulty_table_head: str
+    level_name: dict[str, str]
+    empty: str
+    summary: str
+    level_count: str
+    joiner: str
+    summary_subtasks: str
+    summary_end: str
+    level_word: dict[str, str]
+    nothing_here: str
+    subtasks_heading: str
+    subtasks_intro: str
+    part_of: str
+    umbrella: str
+    no_issue: str
+    assigned: str
+    maint_summary: str
+    maint_body: str
+    maint_footer: str
+
+
 # UI strings for the rendered issue body.
-STRINGS = {
+STRINGS: dict[str, RoadmapStrings] = {
     "en": {
         "issue_title": "[Roadmap] Community task list",
         "generated": (
@@ -230,7 +264,7 @@ class ValidationError(Exception):
     """Raised for any problem that must block publishing."""
 
 
-def fail(msg: str) -> None:
+def fail(msg: str) -> NoReturn:
     raise ValidationError(msg)
 
 
@@ -344,7 +378,8 @@ def validate(tasks_doc: dict) -> list[dict]:
         for field in REQUIRED_FIELDS:
             if field not in task:
                 fail(f"{where}: missing required field '{field}'")
-            if not isinstance(task[field], str) or not task[field].strip():
+            value = task[field]
+            if not isinstance(value, str) or not value.strip():
                 fail(f"{where}: '{field}' must be a non-empty string")
 
         task_id = task["id"]

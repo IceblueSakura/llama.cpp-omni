@@ -1,5 +1,6 @@
-# Token2Wav Python 服务依赖
-# 安装: pip install -r requirements.txt
+# Legacy GPU deployment requirements; CI/dev dependencies are authoritative in
+# pyproject.toml + uv.lock. Use `uv sync --group ci --extra cpu` for CPU CI.
+# 安装: pip install -r requirements.txt （GPU 模型推理需要另外验收）
 
 # PyTorch (需要 CUDA 版本，根据实际 CUDA 版本选择)
 # CUDA 11.8: pip install torch==2.3.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu118
@@ -11,8 +12,8 @@ torchaudio==2.3.1
 stepaudio2-minicpmo==0.1.1
 
 # stepaudio2 的依赖 (通常会自动安装，这里显式指定版本)
-numpy==1.25.2
-librosa==0.9.0
+numpy~=1.26.4
+librosa==0.10.2.post1
 soundfile==0.12.1
 scipy==1.15.3
 diffusers==0.35.2

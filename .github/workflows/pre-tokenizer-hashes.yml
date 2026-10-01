@@ -12,21 +12,16 @@ on:
 
 jobs:
     pre-tokenizer-hashes:
-        runs-on: [self-hosted, fast]
+        runs-on: ubuntu-24.04
+        timeout-minutes: 30
 
         steps:
         - name: Checkout repository
           uses: actions/checkout@v6
 
-        - name: Set up Python
-          uses: actions/setup-python@v6
+        - uses: ./.github/actions/setup-python
           with:
-              python-version: '3.11'
-
-        - name: Install Python dependencies
-          run: |
-              python3 -m venv .venv
-              .venv/bin/pip install -r requirements/requirements-convert_hf_to_gguf_update.txt
+              profile: typecheck
 
         - name: Update pre-tokenizer hashes
           run: |

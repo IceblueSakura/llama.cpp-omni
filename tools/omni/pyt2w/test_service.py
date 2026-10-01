@@ -47,15 +47,17 @@ def main():
         text=True,
         bufsize=1
     )
+    stdin, stdout, stderr_pipe = process.stdin, process.stdout, process.stderr
+    assert stdin is not None and stdout is not None and stderr_pipe is not None
 
     def send_cmd(cmd):
         """发送命令并获取响应"""
         cmd_json = json.dumps(cmd)
         print(f">>> {cmd_json}")
-        process.stdin.write(cmd_json + "\n")
-        process.stdin.flush()
+        stdin.write(cmd_json + "\n")
+        stdin.flush()
 
-        response_line = process.stdout.readline()
+        response_line = stdout.readline()
         response = json.loads(response_line)
         print(f"<<< {json.dumps(response, ensure_ascii=False)}")
         print()
@@ -64,7 +66,7 @@ def main():
     try:
         # 等待服务就绪
         print("等待服务就绪...")
-        ready_line = process.stdout.readline()
+        ready_line = stdout.readline()
         ready = json.loads(ready_line)
         print(f"服务状态: {ready}")
         print()
@@ -137,7 +139,7 @@ def main():
         process.wait(timeout=5)
 
         # 打印 stderr
-        stderr = process.stderr.read()
+        stderr = stderr_pipe.read()
         if stderr:
             print("=" * 50)
             print("服务日志 (stderr):")

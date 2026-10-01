@@ -1,0 +1,35 @@
+name: Locked Python 3.12 environment
+description: Install declared CI dependency groups with uv.lock, without installing the root scripts package
+inputs:
+  profile:
+    description: Dependency profile (ci, typecheck, or publish)
+    default: ci
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+    - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      with:
+        version: '0.12.17'
+        enable-cache: true
+        cache-dependency-glob: '**/uv.lock'
+    - name: Install frozen dependency profile
+      shell: bash
+      env:
+        PROFILE: ${{ inputs.profile }}
+        UV_PYTHON: '3.12'
+        UV_PYTHON_DOWNLOADS: never
+      run: |
+        uv lock --check
+        case "$PROFILE" in
+          ci|publish) uv sync --frozen --only-group "$PROFILE" ;;
+          typecheck) uv sync --frozen --group typecheck --no-install-project ;;
+          *) echo "Unknown dependency profile: $PROFILE" >&2; exit 1 ;;
+        esac
+        if [ "$RUNNER_OS" = Windows ]; then
+          echo "$GITHUB_WORKSPACE/.venv/Scripts" >> "$GITHUB_PATH"
+        else
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+        fi

@@ -125,7 +125,7 @@ def generate_report(ops, top_n, width_overrides, sort_col, pmu_name=None):
         if "pmu" in col_name and pmu_name:
             header_text = header_text.replace("PMU", pmu_name)
 
-        natural_width = max([len(row[data_key]) for row in sorted_groups] + [len(header_text)])
+        natural_width = max([len(str(row[data_key])) for row in sorted_groups] + [len(header_text)])
         target_width  = width_overrides.get(col_name, natural_width)
 
         if target_width == 0:
@@ -145,7 +145,7 @@ def generate_report(ops, top_n, width_overrides, sort_col, pmu_name=None):
     for group in sorted_groups:
         row_vals = []
         for i, key in enumerate(final_keys):
-            val = group[key]
+            val = str(group[key])
             if len(val) > final_widths[i]:
                 val = val[:final_widths[i] - 3] + "..."
             row_vals.append(f"{val:<{final_widths[i]}}")
