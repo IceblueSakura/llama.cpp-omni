@@ -1,43 +1,37 @@
+# Checkout/Node/artifact conventions synced from ggml-org/llama.cpp
+# ca2e2037b68ae7d821113d538110e6ce6903864c; build this project's UI, not upstream PWA tests.
 name: UI Build
 
 on:
   workflow_call:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: ubuntu-slim
-    env:
-      BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
-
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
-          node-version: "24"
-          cache: "npm"
-          cache-dependency-path: "tools/ui/package-lock.json"
-
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: tools/ui/package-lock.json
       - name: Install dependencies
         run: npm ci
         working-directory: tools/ui
-
-      - name: Build application
+      - name: Build UI
         run: npm run build
         working-directory: tools/ui
-
       - name: Generate checksums
         run: |
           cd tools/ui/dist
-          for f in *; do
-            sha256sum "$f" | awk '{print $1, $2}' >> checksums.txt
-          done
-
-      - name: Upload built UI
-        uses: actions/upload-artifact@v6
+          find . -type f ! -name checksums.txt -print0 | sort -z | xargs -0 sha256sum > checksums.txt
+      - uses: actions/upload-artifact@v6
         with:
           name: ui-build
           path: tools/ui/dist/
-          retention-days: 1
+          if-no-files-found: error
+          retention-days: 7

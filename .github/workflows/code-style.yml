@@ -1,21 +1,20 @@
 name: Code Style Checker
 
 on:
-  workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: model-naming-${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   model-naming:
-    runs-on: [self-hosted, fast]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - name: Check model naming conventions
@@ -24,16 +23,21 @@ jobs:
           import re, os, sys
 
           pairs = re.findall(
-              r'case\s+(LLM_ARCH_\w+)\s*:\s*\n\s+return new (llama_model_\w+)\s*\(',
+              r'((?:case\s+LLM_ARCH_\w+\s*:\s*)+)return new (llama_model_\w+)\s*\(',
               open("src/llama-model.cpp").read())
 
           errors = []
-          for arch, cls in pairs:
-              suffix  = arch[len("LLM_ARCH_"):]
+          if not pairs:
+              errors.append("No model factory mappings found; update this check if the factory changes")
+          for cases, cls in pairs:
+              # Shared implementations can have several adjacent case labels (e.g. MiniCPM4).
+              arches = re.findall(r'LLM_ARCH_(\w+)', cases)
+              suffix = next((name for name in arches if name.lower() == cls[len("llama_model_"):]), arches[0])
+              arch = "/".join(f"LLM_ARCH_{name}" for name in arches)
               csuffix = cls[len("llama_model_"):]
               fname   = csuffix.replace("_", "-") + ".cpp"
 
-              if not re.fullmatch(r'[A-Z][A-Z0-9_]*',   suffix):
+              if any(not re.fullmatch(r'[A-Z][A-Z0-9_]*', name) for name in arches):
                   errors.append(f"{arch}: suffix not upper snake case, example: LLM_ARCH_MY_MODEL")
 
               if not re.fullmatch(r'[a-z][a-z0-9_]*', csuffix):

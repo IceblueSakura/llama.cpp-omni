@@ -5,11 +5,15 @@ on:
 
 jobs:
   linux:
-    runs-on: [self-hosted, Linux, CPU]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y tcl
 
       - name: Build
         run: |

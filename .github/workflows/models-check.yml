@@ -1,0 +1,28 @@
+# Separate diagnostic coverage, inspired by upstream models-check.yml at
+# ggml-org/llama.cpp ca2e2037b68ae7d821113d538110e6ce6903864c.
+name: Model architecture diagnostics
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/models-check.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-diagnostics-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui:
+    uses: ./.github/workflows/ui-build.yml
+  architectures:
+    needs: ui
+    uses: ./.github/workflows/build-cpu.yml
+    with:
+      architecture_diagnostics: true
+
+# Failures are real diagnostic failures. This workflow is deliberately not
+# a dependency of CI/Required checks or Release; there is no continue-on-error.

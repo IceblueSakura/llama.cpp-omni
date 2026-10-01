@@ -1,112 +1,39 @@
 name: Server (sanitize)
 
 on:
-  workflow_dispatch: # allows manual triggering
-    inputs:
-      sha:
-        description: 'Commit SHA1 to build'
-        required: false
-        type: string
-      slow_tests:
-        description: 'Run slow tests'
-        required: true
-        type: boolean
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/server-sanitize.yml',
-      '**/CMakeLists.txt',
-      '**/Makefile',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      'tools/server/**.*'
-    ]
+  workflow_dispatch:
 
-env:
-  LLAMA_ARG_LOG_COLORS: 1
-  LLAMA_ARG_LOG_PREFIX: 1
-  LLAMA_ARG_LOG_TIMESTAMPS: 1
-  LLAMA_ARG_LOG_VERBOSITY: 10
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+permissions:
+  contents: read
 
 jobs:
   server:
-    runs-on: [self-hosted, CPU, Linux, llama-server]
-
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     strategy:
-      matrix:
-        sanitizer: [ADDRESS, UNDEFINED] # THREAD is very slow
-        build_type: [RelWithDebInfo]
       fail-fast: false
-
+      matrix:
+        sanitizer: [ADDRESS, UNDEFINED]
     steps:
-      #- name: Dependencies
-      #  id: depends
-      #  run: |
-      #    sudo apt-get update
-      #    sudo apt-get -y install \
-      #      build-essential \
-      #      xxd \
-      #      git \
-      #      cmake \
-      #      curl \
-      #      wget \
-      #      language-pack-en \
-      #      libssl-dev
-
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          cache: "npm"
-          cache-dependency-path: "tools/ui/package-lock.json"
-
-      - name: Build
-        id: cmake_build
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-python
+      - name: Build supported servers
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
         run: |
-          cmake -B build \
-            -DLLAMA_BUILD_BORINGSSL=ON \
-            -DGGML_SCHED_NO_REALLOC=ON \
-            -DGGML_SANITIZE_ADDRESS=${{ matrix.sanitizer == 'ADDRESS' }} \
-            -DGGML_SANITIZE_THREAD=${{ matrix.sanitizer == 'THREAD' }} \
-            -DGGML_SANITIZE_UNDEFINED=${{ matrix.sanitizer == 'UNDEFINED' }} \
-            -DLLAMA_SANITIZE_ADDRESS=${{ matrix.sanitizer == 'ADDRESS' }} \
-            -DLLAMA_SANITIZE_THREAD=${{ matrix.sanitizer == 'THREAD' }} \
-            -DLLAMA_SANITIZE_UNDEFINED=${{ matrix.sanitizer == 'UNDEFINED' }}
-          cmake --build build --config ${{ matrix.build_type }} -j $(nproc) --target llama-server
-
-      - name: Python setup
-        id: setup_python
-        uses: actions/setup-python@v6
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
+            -DLLAMA_BUILD_BORINGSSL=ON -DLLAMA_OPENSSL=OFF -DGGML_OPENMP=OFF \
+            -DLLAMA_SANITIZE_${SANITIZER}=ON -DGGML_SANITIZE_${SANITIZER}=ON
+          cmake --build build --parallel 4 --target llama-omni-server llama-tts-server llama-omni-cli voxcpm2-cli
+      - name: Model-free protocol and lifecycle tests
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: python ci/smoke.py --bin-dir build/bin --tls
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
         with:
-          python-version: '3.11'
-          pip-install: -r tools/server/tests/requirements.txt
-
-      - name: Tests
-        id: server_integration_tests
-        if: ${{ (!matrix.disabled_on_pr || !github.event.pull_request) }}
-        run: |
-          cd tools/server/tests
-          export ${{ matrix.extra_args }}
-          pytest -v -x -m "not slow"
-
-      - name: Slow tests
-        id: server_integration_tests_slow
-        if: ${{ (github.event.schedule || github.event.inputs.slow_tests == 'true') && matrix.build_type == 'Release' }}
-        run: |
-          cd tools/server/tests
-          export ${{ matrix.extra_args }}
-          SLOW_TESTS=1 pytest -v -x
+          name: server-sanitize-${{ matrix.sanitizer }}
+          path: build/omni-smoke-logs/
+          if-no-files-found: ignore

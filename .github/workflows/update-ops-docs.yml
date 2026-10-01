@@ -1,22 +1,16 @@
 name: Update Operations Documentation
 
 on:
-    push:
-        paths:
-            - '.github/workflows/update-ops-docs.yml'
-            - 'docs/ops.md'
-            - 'docs/ops/**'
-            - 'scripts/create_ops_docs.py'
-    pull_request:
-        paths:
-            - '.github/workflows/update-ops-docs.yml'
-            - 'docs/ops.md'
-            - 'docs/ops/**'
-            - 'scripts/create_ops_docs.py'
+    workflow_dispatch:
+    workflow_call:
+
+permissions:
+    contents: read
 
 jobs:
     update-ops-docs:
-        runs-on: [self-hosted, fast, ARM64]
+        runs-on: ubuntu-24.04
+        timeout-minutes: 10
 
         steps:
         - name: Checkout repository
@@ -25,7 +19,7 @@ jobs:
         - name: Set up Python
           uses: actions/setup-python@v6
           with:
-              python-version: '3.x'
+              python-version: '3.12'
 
         - name: Generate operations documentation to temporary file
           run: |

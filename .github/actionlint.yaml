@@ -1,0 +1,16 @@
+# Optional workflows use organization-managed runners, not GitHub-hosted images.
+self-hosted-runner:
+  labels:
+    - CPU
+    - NVIDIA
+    - COOPMAT2
+    - Intel
+    - OpenVINO
+    - PLAYWRIGHT
+    - fast
+    - llama-server
+    - opencode
+    - ubuntu-24.04-s390x
+    - ubuntu-24.04-ppc64le
+    - ubuntu-24.04-riscv
+    - ah-ubuntu_22_04-c8g_8x
