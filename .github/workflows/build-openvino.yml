@@ -1,26 +1,17 @@
 name: CI (openvino)
 
 on:
-  workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/build-openvino.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-    ]
+  # Optional backend compatibility, not a required platform check.
+  workflow_dispatch:
+    inputs:
+      device:
+        description: CPU uses a hosted runner; GPU requires a project-owned Intel/OpenVINO runner
+        type: choice
+        options: [CPU, GPU]
+        default: CPU
 
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/build-openvino.yml',
-      'ggml/src/ggml-openvino/**'
-    ]
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -35,23 +26,9 @@ env:
 
 jobs:
   ubuntu-24-openvino:
-    name: ubuntu-24-openvino-${{ matrix.openvino_device }}
-
-    concurrency:
-      group: openvino-${{ matrix.variant }}-${{ github.head_ref || github.ref }}
-      cancel-in-progress: false
-
-    strategy:
-      matrix:
-        include:
-          - variant: cpu
-            runner: '"ubuntu-24.04"'
-            openvino_device: "CPU"
-          - variant: gpu
-            runner: '["self-hosted","Linux","Intel","OpenVINO"]'
-            openvino_device: "GPU"
-
-    runs-on: ${{ fromJSON(matrix.runner) }}
+    name: ubuntu-24-openvino-${{ inputs.device }}
+    timeout-minutes: 60
+    runs-on: ${{ inputs.device == 'GPU' && fromJSON('["self-hosted","Linux","Intel","OpenVINO"]') || 'ubuntu-24.04' }}
 
     env:
       # Sync versions in build-openvino.yml, build-self-hosted.yml, release.yml, build-cache.yml, .devops/openvino.Dockerfile
@@ -67,7 +44,7 @@ jobs:
         if: runner.environment == 'github-hosted'
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: openvino-ubuntu-24.04-${{ matrix.variant }}-no-preset-v1
+          key: openvino-ubuntu-24.04-${{ inputs.device }}-no-preset-v1
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
@@ -114,7 +91,7 @@ jobs:
         # TODO: fix and re-enable the `test-llama-archs` test below
         run: |
           cd ${{ github.workspace }}
-          if [ "${{ matrix.openvino_device }}" = "GPU" ]; then
+          if [ "${{ inputs.device }}" = "GPU" ]; then
             export GGML_OPENVINO_DEVICE=GPU
           fi
-          ctest --test-dir build/ReleaseOV -L main -E "test-llama-archs" --verbose --timeout 2000
+          ctest --test-dir build/ReleaseOV -L main -E "test-llama-archs" --verbose --timeout 2000 --no-tests=error

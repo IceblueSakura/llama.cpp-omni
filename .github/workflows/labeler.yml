@@ -2,16 +2,22 @@ name: "Pull Request Labeler"
 on:
 - pull_request_target
 
+permissions:
+  contents: read
+
 jobs:
   labeler:
     permissions:
       contents: read
       pull-requests: write
     runs-on: ubuntu-slim
+    timeout-minutes: 5
     steps:
+    # Only the trusted base revision supplies configuration; never check out PR code.
     - uses: actions/checkout@v6
       with:
-        repository: "ggml-org/llama.cpp"
+        ref: ${{ github.event.pull_request.base.sha }}
+        persist-credentials: false
     - uses: actions/labeler@v6
       with:
         configuration-path: '.github/labeler.yml'

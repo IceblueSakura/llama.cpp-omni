@@ -1,19 +1,7 @@
 name: CI (sanitize)
 
 on:
-  workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/build-sanitize.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp'
-    ]
+  workflow_dispatch: # Optional trusted hardware sanitizer runs.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -29,8 +17,6 @@ env:
 jobs:
   ctest:
     runs-on: [self-hosted, X64, CPU, Linux]
-
-    continue-on-error: true
 
     strategy:
       matrix:

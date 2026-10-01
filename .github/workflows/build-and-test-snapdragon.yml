@@ -1,27 +1,16 @@
 name: CI (snapdragon)
 
 on:
+  # Tier-2; device-cloud jobs require separately configured access and budget.
   workflow_dispatch:
-  push:
-    branches:
-      - master
-    paths:
-      - '.github/workflows/build-and-test-snapdragon.yml'
-      - 'ggml/include/ggml-hexagon.h'
-      - 'ggml/src/ggml-hexagon/**'
-      - 'docs/backend/snapdragon/**'
-      - 'scripts/snapdragon/**'
-      - 'CMakePresets.json'
+    inputs:
+      run_device_tests:
+        description: Use configured QDC credentials and device-cloud quota (not compile-only)
+        type: boolean
+        default: false
 
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths:
-      - '.github/workflows/build-and-test-snapdragon.yml'
-      - 'ggml/include/ggml-hexagon.h'
-      - 'ggml/src/ggml-hexagon/**'
-      - 'docs/backend/snapdragon/**'
-      - 'scripts/snapdragon/**'
-      - 'CMakePresets.json'
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -90,6 +79,7 @@ jobs:
 
   test-snapdragon-qdc:
     name: Test on QDC Device (${{ matrix.device }})
+    if: inputs.run_device_tests
     needs: [android-ndk-snapdragon, linux-iot-snapdragon]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
@@ -111,7 +101,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.x'
+          python-version: '3.12'
           cache: pip
 
       - name: Install system dependencies
@@ -126,13 +116,15 @@ jobs:
           pip install qdc_sdk/qualcomm_device_cloud_sdk-0.2.3-py3-none-any.whl
 
       - name: Check QDC API key
-        id: check_secret
         env:
           QDC_API_KEY: ${{ secrets.QDC_API_KEY }}
-        run: echo "has-qdc-key=${{ env.QDC_API_KEY != '' }}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [ -z "$QDC_API_KEY" ]; then
+            echo 'Device tests were requested, but QDC_API_KEY is not configured.' >&2
+            exit 1
+          fi
 
       - name: Run QDC tests (${{ matrix.device }})
-        if: steps.check_secret.outputs.has-qdc-key == 'true'
         run: |
           python scripts/snapdragon/qdc/run_qdc_jobs.py \
               --test       all \

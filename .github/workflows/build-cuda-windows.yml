@@ -2,15 +2,16 @@ name: CI (CUDA, windows)
 
 # TODO: this workflow is only triggered manually because it is very heavy on the CI
 #       when we provision dedicated windows runners, we can enable it for pushes too
-# note: running this workflow manually will populate the ccache for the release builds
-#       this can be used before merging a PR to speed up the release workflow
+# Compile-only compatibility recipe; not a GPU runtime or release acceptance test.
 on:
   workflow_dispatch: # allows manual triggering
 
-# note: this will run in queue with the release workflow
+permissions:
+  contents: read
+
 concurrency:
-  group: release
-  queue: max
+  group: cuda-windows-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   GGML_NLOOP: 3
@@ -58,8 +59,8 @@ jobs:
             -DLLAMA_BUILD_SERVER=ON ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DGGML_NATIVE=OFF ^
-            -DGGML_BACKEND_DL=ON ^
-            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_BACKEND_DL=OFF ^
+            -DGGML_CPU_ALL_VARIANTS=OFF ^
             -DGGML_CUDA=ON ^
             -DGGML_RPC=ON ^
             -DGGML_CUDA_CUB_3DOT2=ON

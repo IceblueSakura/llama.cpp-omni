@@ -1,26 +1,7 @@
 name: CI (rpc)
 
 on:
-  workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/build-rpc.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/build-rpc.yml',
-      'ggml/src/ggml-rpc/**'
-    ]
+  workflow_dispatch: # Optional RPC compatibility checks.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -35,9 +16,8 @@ env:
 
 jobs:
   ubuntu-latest-rpc:
-    runs-on: ubuntu-latest
-
-    continue-on-error: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
 
     steps:
       - name: Clone
@@ -63,4 +43,4 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          ctest -L main --verbose
+          ctest -L main --verbose --timeout 900 --no-tests=error

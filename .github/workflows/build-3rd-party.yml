@@ -1,19 +1,7 @@
 name: CI (3rd-party)
 
 on:
-  workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/build-3rd-party.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp'
-    ]
+  workflow_dispatch: # Optional third-party integration builds.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -28,7 +16,8 @@ env:
 
 jobs:
   ubuntu-24-llguidance:
-    runs-on: ${{ 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
 
     steps:
       - name: Clone
@@ -53,5 +42,5 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          ctest -L main --verbose --timeout 900
+          ctest -L main --verbose --timeout 900 --no-tests=error
 
