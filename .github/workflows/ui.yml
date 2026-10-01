@@ -2,28 +2,10 @@ name: UI
 
 on:
   workflow_dispatch:
-    inputs:
-      sha:
-        description: 'Commit SHA1 to build'
-        required: false
-        type: string
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/ui.yml',
-      '.github/workflows/ui-build.yml',
-      'tools/ui/**.*',
-      'tools/server/tests/**.*'
-    ]
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/ui.yml',
-      '.github/workflows/ui-build.yml',
-      'tools/ui/**.*',
-      'tools/server/tests/**.*'
-    ]
+  workflow_call:
+
+permissions:
+  contents: read
 
 env:
   LLAMA_ARG_LOG_COLORS: 1
@@ -32,25 +14,19 @@ env:
   LLAMA_ARG_LOG_VERBOSITY: 10
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || github.run_id }}
+  group: ui-checks-${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
-  ui-build:
-    name: Build static output
-    uses: ./.github/workflows/ui-build.yml
-
   ui-checks:
     name: Checks
-    needs: ui-build
-    runs-on: ubuntu-latest
-    continue-on-error: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
 
       - name: Setup Node.js
         id: node
@@ -84,24 +60,23 @@ jobs:
 
       - name: Run Client tests
         if: ${{ always() && steps.playwright.conclusion == 'success' }}
-        run: npm run test:client
+        run: npm run test:client -- --run
         working-directory: tools/ui
 
       - name: Run Unit tests
         if: ${{ always() && steps.playwright.conclusion == 'success' }}
-        run: npm run test:unit
+        run: npm run test:unit -- --run
         working-directory: tools/ui
 
   e2e-tests:
     name: E2E Tests
-    needs: ui-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
 
       - name: Setup Node.js
         id: node
@@ -135,7 +110,7 @@ jobs:
 
       - name: Run UI tests
         if: ${{ always() && steps.playwright.conclusion == 'success' }}
-        run: npm run test:ui -- --testTimeout=60000
+        run: npm run test:ui -- --run --testTimeout=60000
         working-directory: tools/ui
 
       - name: Run E2E tests
