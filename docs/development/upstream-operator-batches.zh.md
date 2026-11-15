@@ -18,8 +18,8 @@
 | 批次 | 候选范围 | 共享验证环境 / 交付边界 |
 |---|---|---|
 | L1：局部索引与 view 正确性 | A04 CPU `CONCAT`、A02 CUDA `CPY`、B01 CPU/CUDA `CLAMP` | 已验证并提交为 `d5ae271`；当前 Nix CUDA devShell，CPU 与 RTX 5060 |
-| L2：CUDA 局部修补 | A05 MoE selection NaN、A09 IQ4_NL 短行、A11 ARGSORT CUB alias | 已移植并完成本机针对性验证，按用户授权纳入本批提交，见第 6 节。B08 量化 correction 未纳入 |
-| L3：Vulkan 正确性 | B06 matmul stride、B05 FA 边界与 scratch；B03 Vulkan 部分按依赖加入 | 独立 Vulkan build，validation；覆盖 MM/MMV/ID 及 scratch 复用链。不混入 D02 紧凑 tile 重组 |
+| L2：CUDA 局部修补 | A05 MoE selection NaN、A09 IQ4_NL 短行、A11 ARGSORT CUB alias | 已提交 `6be022a`，见第 6 节。B08 量化 correction 未纳入 |
+| L3：Vulkan 正确性 | B06 matmul stride、B05 FA 边界与 scratch | 已移植并完成本机针对性检查，按用户授权纳入本次提交，见第 7 节。B03 和 D02 紧凑 tile 重组未纳入 |
 | M1：Metal 局部正确性 | A03 CPY stride、A06 TRI NaN/Inf、A07 SOLVE_TRI 尾读 | 待用户提供 macOS 环境，在真实 Metal 设备上验收；不以 Linux 编译/静态检查代替 |
 | M2：Metal 配套修补 | A12 大偏移、B02 Metal transpose-conv、B03 Metal group norm、B09 FA | 真机内存/shape 与 shader validation；进入批次后按实际依赖拆成可验收子组，不能为了批量而混入整套 FA 重构 |
 | 后续能力与性能批次 | C 类按 backend/算子族分组，再考虑 D 类 | 先证明 omni 图可达，再做数值与性能验证；不将新 kernel 存在写成模型收益 |
@@ -134,7 +134,7 @@ build-operators-asan/bin/test-backend-ops test -b CPU -o CLAMP -p 'v=1' -j 1
 
 ## 6. L2：本机 CUDA 局部修补
 
-基点为 L1 `d5ae271f09c3e5ed1140408b28b7564c355451ca`，复用上述 Nix 环境和 RTX 5060。状态：**已完成针对性验证，按用户授权提交至 fork 工作分支**；不推送或移动 master，提交号以 Git 历史为准。不需要额外 GGUF/权重模型；不扩展到 B08、Metal 或新模型能力。
+基点为 L1 `d5ae271f09c3e5ed1140408b28b7564c355451ca`，复用上述 Nix 环境和 RTX 5060。状态：**已完成针对性验证，按用户授权提交至 fork 工作分支**：`6be022af5c33acd262d754f7e76d2200d64a9411`；未推送或移动 master。不需要额外 GGUF/权重模型；不扩展到 B08、Metal 或新模型能力。
 
 ### 来源与最小适配
 
@@ -198,3 +198,133 @@ ctest --test-dir build-operators-cuda -R '^test-cuda-convert$' --output-on-failu
 - `l2-sources.b3`：本批 6 个源码/测试文件快照；从 worktree 根目录用 `b3sum -c` 核对。
 
 所有性能收益均未测量；本批是正确性回移植，不据小张量验收声称模型加速或覆盖其他硬件。下一批继续优先考虑本机可验证的 Vulkan 正确性候选。
+
+## 7. L3：本机 Vulkan 正确性
+
+基点为 L2 `6be022af5c33acd262d754f7e76d2200d64a9411`。状态：**已移植并完成下述针对性检查，按用户授权提交至 fork 工作分支**，提交号以 Git 历史为准，未推送或移动 master。不需要 GGUF/权重模型。两项独立只读依赖审查均完成；最终结论以实际运行和已注明的检测边界为准。
+
+### 来源与边界
+
+| 候选 | 完整上游 commit / PR | 本批内容 |
+|---|---|---|
+| B06 | `52624716156a25af417b616e23bc712452d9396c` / #28956 | MM、MMV、MM-ID、MMV-ID 原位 A/B 按 `nb[2]/type_size*block_size` 取 stride；MM/ID descriptor 使用原位 strided extent 或 staged size，不能扩大到 buffer 尾部 |
+| B05 rowmax | `ac4105d68b2955027115cf9bb50941ccf56974eb` / #24909 | generic/cm1 在 softmax 前应用已有 `FATTN_KQ_MAX_OFFSET`，避免未归一化 FP16 分子溢出 |
+| B05 scratch | `806eee9841de5f2c20f9d43914117f157d2baacc` / #29591 | FA mask-opt、large softmax 覆盖 `prealloc_y` 时清空转换缓存标识；omni 没有上游 `use_sparse`，不引入它 |
+| B05 MMQ shared | `6c59c40076c00eab49754dc955d7652d93f9e125` / #29988 | Q 量化 shared 写入增加 `r<Br`，subgroup 归约保留在分支外；保留 omni 的 `FA_TYPE_*`、`FLOAT_TYPE`，不引入上游额外 FP32 量化重构 |
+
+B06 不引入上游后续 MM-ID K-padding staging、test `src_overlap` 或 `amax` 参数。只追加当前 fixture 所需的 `m_v/pad`，移植六个上游 A-view/padding 用例；另加四个 B-only batch/token stride 用例，验证本次同时修改的 B 寻址。没有新增测试框架。
+
+### 关键用例和证据
+
+- **matmul**：六个上游 A-view 用例覆盖四条执行路径及 `nb[2]` 非整行 padding；四个 B-only 用例覆盖 MM/MMV、单/多 token ID。debug dispatch 核实 MM/ID 与实际 stride，例如 F16 padded A 为 1032 元素；descriptor 不越过真实 extent。Q4_0/NVFP4 partial-tile 各一例用于防止过宽 range 让量化尾 tile 读取残留。
+- **FA 溢出**：Q/K 全零、V=4096，输出独立预期为4096。初版 F16 K/V 用例在 CPU 自身也失败，故最终用 F32 K/V，使 CPU oracle 通过、GPU 仍走 FP16 中间计算。修复前 generic 出现最大浮点值、cm1 为65504，而 CPU 为4096；修复后两条路径均通过。没有在本批修改 CPU FA。
+- **scratch**：同一次 graph compute 内执行 `I·X → FA mask-opt/large softmax → 2I·X`，两个 matmul 使用相同的非连续 X 指针，输出独立预期为 `1+2X`。`run_whole_graph=true`，避免逐节点 compute 清空缓存而掩盖问题；X 的转换区8192字节，大于 large-softmax 临时区4224字节，不靠中途扩容触发失效。日志确认覆盖节点、相同 RHS 的两次转换，以及 scratch buffer 复用。
+- **量化 FA 尾行**：Q4_0 K、单 query、HSK64，零 Q/K、V=1，命中 generic MMQ 的小 Br 几何；数值与 validation 冒烟通过。**旧版此例也通过，普通 validation 不保证检测 Workgroup/shared 数组越界，因此不声称已取得共享内存越界的动态红绿证明。** 修复依据为上游边界条件、实际 dispatch 几何和源码核对。
+
+### 实际结果
+
+| 阶段 / 设备路径 | 实际结果 |
+|---|---|
+| 最终 fixture 的 CPU oracle | **14/14**，exit 0 |
+| 修复前 NVIDIA generic | **1/14**，exit 1：10 个 matmul、FA 溢出、2 条 scratch 链失败；量化尾行冒烟通过 |
+| 修复前 NVIDIA cm1 的 FA/scratch 子组 | **1/4**，exit 1：FA 溢出和2条 scratch 链失败 |
+| 修复后 NVIDIA generic / cm1 | 分别 **14/14**，exit 0，且确认实际 generic / `_cm1` dispatch |
+| 修复后 NVIDIA 默认 coopmat2、默认 fusion | **14/14**，exit 0 |
+| NVIDIA generic Q4_0/NVFP4 partial-tile | **2/2**，exit 0，没有超时 |
+| 既有混合量化/非整块 FA：NVIDIA cm2 / generic / cm1 | 分别 **8/8、4/4、4/4**；非 cm2 的4个 Q1_0 不支持项不计入通过 |
+| AMD RADV generic 新用例 / 既有混合量化 FA | **14/14、4/4**；4个 Q1_0 不支持项不计入通过 |
+| 最终 NVIDIA/RADV validation | 无 `Validation Error` / VUID error；仍有已有 `BestPractices-SpirvDeprecated_WorkgroupSize` warning |
+
+初轮强制关闭 coopmat2、却未关闭 decode-vector 时，出现 `VUID-vkCreateDevice-ppEnabledExtensionNames-01387`：后者扩展依赖前者。最终非 cm2 测试同时设置两项禁用开关，消除该已有初始化告警；没有扩展本批为后端 capability 改造。
+
+AMD 首次使用主机 Mesa 26.3 的 ICD 时，LLVM 要求 `GLIBC_2.44`，与项目环境 glibc 2.42 不匹配，Vulkan 注册失败、实际0个 Vulkan case。尽管 harness exit 0，该次**不计为通过**。随后只在本测试进程指定项目同一 nixpkgs pin 的 Mesa 26.2.3 ICD，实际识别 RADV 核显并完成上述检查；未替换主机驱动或修改 Nix inputs/lock。
+
+### 环境与复验
+
+```bash
+cd /home/sakura/workspace/llm/llama.cpp-omni-operators
+nix develop --no-update-lock-file .#vulkan --command bash -c '
+  set -e
+  cmake -S . -B build-operators-vulkan -G Ninja \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGGML_VULKAN=ON \
+    -DGGML_VULKAN_DEBUG=ON -DGGML_VULKAN_VALIDATE=ON \
+    -DGGML_CUDA=OFF -DGGML_BLAS=OFF -DGGML_CCACHE=OFF \
+    -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=OFF \
+    -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+    -DLLAMA_BUILD_APP=OFF -DLLAMA_OPENSSL=OFF
+  cmake --build build-operators-vulkan --target test-backend-ops -j 6
+'
+```
+
+在该 devShell 内运行；用 ICD 固定设备后，测试器名称均为 `Vulkan0`，仍须核对实际设备和 case 数：
+
+```bash
+export VK_DRIVER_FILES=/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json
+export VK_LAYER_PATH=/run/opengl-driver/share/vulkan/explicit_layer.d
+export GGML_VK_DISABLE_COOPMAT=1 GGML_VK_DISABLE_COOPMAT2=1
+export GGML_VK_DISABLE_COOPMAT2_DECODE_VECTOR=1 GGML_VK_DISABLE_FUSION=1
+T=build-operators-vulkan/bin/test-backend-ops
+timeout 120s "$T" test -b Vulkan0 \
+  -o MUL_MAT,MUL_MAT_ID,MUL_MAT_RHS_VIEW,FLASH_ATTN_CONSTANT,MATMUL_SCRATCH_REUSE \
+  -p 'm_v=(5120|16|64)(,|$)|^(n=|hsk=|flash=)' -j 1
+# cm1: unset GGML_VK_DISABLE_COOPMAT。默认 cm2/fusion: unset 全部四个 GGML_VK_DISABLE_* 开关。
+timeout 120s "$T" test -b Vulkan0 -o MUL_MAT \
+  -p 'type_a=(nvfp4|q4_0),type_b=f32,m=1,n=64,k=256,' -j 1
+timeout 120s "$T" test -b Vulkan0 -o FLASH_ATTN_EXT \
+  -p 'hsk=(64|72|128),hsv=(64|72|128),nh=4,nr23=\[1,1\],kv=(64|96|128),nb=2,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32' -j 1
+```
+
+AMD 使用兼容的 Mesa，而不是混入更新主机 glibc：
+
+```bash
+MESA=$(nix build --impure --no-link --print-out-paths --expr \
+  'let f = builtins.getFlake "/home/sakura/workspace/llm/llama.cpp-omni-operators";
+       p = import f.inputs.nixpkgs { system = "x86_64-linux"; };
+   in p.mesa')
+export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
+# 保持 generic 开关，复用上面的14例及混合量化 FA 命令。
+```
+
+实际解析的 Mesa 为 `/nix/store/1vkzwrp4ny20iljfnv9valq0bfn8czlv-mesa-26.2.3`；shaderc 2026.1、Vulkan loader 1.4.357，validation layer 1.4.363，NVIDIA driver 615.78.08。可复用环境未作持久声明修改。
+
+完整本地证据保存在忽略的 `build-operators-vulkan/evidence/`：
+
+- `l3-baseline-build.log`、`l3-red-initial.log`、`l3-red.log`
+- `l3-nvidia-green.log`、`l3-nvidia-default.log`
+- `l3-radv-host-unavailable.log`、`l3-mesa-env.log`、`l3-radv-green.log`
+- `l3-sources.b3`：本批4个源码/测试文件快照，在对应源码状态的 worktree 根目录用 `b3sum -c` 核对。
+
+这些检查不等于完整 Vulkan suite、模型端到端性能或 Metal 验收；本批没有测量加速比。
+
+## 8. L3 提交时的整体进度与剩余候选
+
+统计单位为主调研的稳定候选 ID，不是 commit 数、后端数或工时。53 组候选中，**8 组已回移植并完成已记录的针对性检查，45 组尚未开展**；不存在已修改代码、尚未收口的其他候选。这里的“已回移植”不表示所有平台、模型和检测手段均已验收，尤其保留 B05 shared-memory 动态检测缺口和 A11 本机未复现旧故障的说明。
+
+| 批次 | 候选 ID | 提交 |
+|---|---|---|
+| L1 | A02、A04、B01 | `d5ae271f09c3e5ed1140408b28b7564c355451ca` |
+| L2 | A05、A09、A11 | `6be022af5c33acd262d754f7e76d2200d64a9411` |
+| L3 | B05、B06 | 本次 `ggml-vulkan: apply batch L3 correctness fixes` 提交 |
+
+### 剩余清单（完整 ID）
+
+| 分类 | 已移植 / 总数 | 尚未开展 |
+|---|---|---|
+| A：单后端局部修补 | 5 / 12 | A01 ARM tile；A03 Metal CPY；A06 TRI；A07 SOLVE_TRI；A08 Vulkan NVFP4 scale LUT；A10 CPU 反向算子 alias；A12 Metal 64-bit offset |
+| B：配套正确性/helper | 3 / 13 | B02 transpose-conv；B03 norm；B04 CPU FA；B07 CUDA/HIP MMF/MMID；B08 CUDA 量化 correction；B09 Metal FA；B10 CUDA FA/norm/softmax 同步；B11 大 grid；B12 view/GLU；B13 CPU ISA/helper |
+| C：backend/类型能力补齐 | 0 / 10 | C01–C10：池化、reflect pad、Metal PAD、SET_ROWS/BF16、卷积/IM2COL、GDN/GLA、OpenCL/WebGPU、量化快路及训练算子 |
+| D：性能组织变化 | 0 / 10 | D01–D10：CPU tiled、紧凑专家 tile、MMQ/少行 matmul、routing/reduce/top-k/FA 融合、ARM repack、移动端及布局/归约优化 |
+| E：公共合同/新能力 | 0 / 8 | E01–E08：precision、跳过 expert ID、RoPE、SSM/GDN 状态、稀疏 FA、新 opcode、模型索引及新格式 |
+
+多后端候选进入实施时按实际子项记录；例如只完成 B02 的 CPU 部分，不能把其 Metal 部分也标记为完成。C–E 是候选池，不是必须全做的既定移植队列；性能组织和公共合同的成本不能按当前8组小修复线性估算。
+
+### 后续建议：仍先做本机能验证的正确性
+
+1. **下一批优先**：B04 CPU FA（L3 已观察到 F16 reference 未满足常量预期）、A08 Vulkan NVFP4 LUT、B03 的 CPU/Vulkan norm 子项。进入批次后分别核对上游依赖，B03 的 Metal 子项保留待办。
+2. **后续 CUDA 正确性批次**：B08、B07 的 CUDA 子项，然后按依赖拆 B10/B11；同步问题需对应 racecheck/synccheck，不只看普通数值输出。HIP 特有部分不以 CUDA/RADV 测试代替。
+3. **其余本机修补**：B02 CPU、B12 的适用 view/GLU 子项、B13 当前 x86 ISA 可达项；A10 主要服务反向/训练，推理优先级较低。
+4. **能力补齐**：优先评估直接对应 omni 音频路径的 C01 CUDA/Vulkan POOL_1D、C02 Vulkan PAD_REFLECT_1D，再按模型图可达性选择其余 C 类；WebGPU 部分单独验证。
+5. **待目标环境**：A03/A06/A07/A12 与 B09、其他 Metal 子项等在 macOS 真机处理；A01、ARM/SVE/NEON、AMX、HIP、Adreno/Hexagon 项需核对实际 ISA/硬件，不能因 Linux 主机或任意 macOS 可用就算覆盖。
+6. **后置**：D 类须证明实际热点和端到端收益；E 类需要独立迁移设计。需要具体权重模型时再列出用途和资源需求，目前没有新增模型下载需求。
+
+扩展文档 X01–X06 **不计入这53组**，本算子分支未推进其自研/LES 适配；涉及原 LES 工作的疑点须核对该会话最新状态，不能把旧调研位置当作仍未修复的证据。
