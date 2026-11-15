@@ -334,9 +334,9 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 ## 9. 当前确定的集成、发布与下一批方向
 
 当前 LES 检查点为 `81221392bc89eaf0836898d463123e123b3171aa`，算子为 `b17420c347612951dd3832794e1212dec515bbf4`，共同基点仍为 `350a835d5f8215145aa210a7df0f67e8877b5d6e`。
-分步验证的**主记录**在 LES 工作区 `/home/sakura/workspace/llm/llama.cpp-omni/docs/les/HANDOFF.md` 第 6 节 I0–I5；该文件尚不在算子分支中，不复制一份平行集成计划。计划未提交时读取工作区版本，不能以旧 `git show` 内容代替。
+分步验证的**计划**在 LES 工作区 `/home/sakura/workspace/llm/llama.cpp-omni/docs/les/HANDOFF.md` 第 6 节 I0–I5；随后逐步执行的**唯一结果记录**在独立 `integration/les-operators` 分支的同名文件，工作区 `/home/sakura/workspace/llm/llama.cpp-omni-integration`。可用 `git show integration/les-operators:docs/les/HANDOFF.md` 读取，不在算子源分支复制平行执行记录。
 
-**本轮仅调整计划**：没有创建 integration/发布分支、没有 merge、构建或新测试结果，没有提交/推送。已回移植仍为8组，剩余45组仍是候选池，不是发布前必须完成的清单。
+原计划确认时仅调整文档；用户随后授权逐步执行、每步提交。组合 I0–I4 及首个 I5 本地候选的精确范围、输入和结果见上述集成记录；本算子源分支仍保留独立已测代码，没有合入 LES 生产代码。未推送/发布；已回移植仍为8组，剩余45组仍是候选池，不是发布前必须完成的清单。
 
 ### 本算子工作线的交付顺序
 
