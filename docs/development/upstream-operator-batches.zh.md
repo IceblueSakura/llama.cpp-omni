@@ -9,7 +9,7 @@
 - 候选及稳定 ID 见 [上游算子调研](upstream-operator-survey.zh.md)；没有直接上游方案的事项见 [扩展调研](upstream-operator-extensions.zh.md)，不混入本执行队列。
 - 按同类契约、共享构建与设备分批移植和验收，不要求每项重建整个环境。每项保留来源、必要依赖和测试结果；批次不等于不可拆分的大提交。
 - 只移植当前批次所需的修复、测试及最小前置依赖。不为套用上下文引入性能优化、公共 API 或整个后端更新。
-- 不修改原 LES 工作区，不自动提交、推送或发布。合并到 master 前由用户审查并决定。
+- 算子实现不修改原 LES 源码或历史；当前用户确认的联动仅调整双方计划文档。不自动提交、推送或发布，合并到 master 前由用户审查并决定。当前分步集成与发布顺序见第 9 节。
 
 ## 2. 推荐队列
 
@@ -19,13 +19,13 @@
 |---|---|---|
 | L1：局部索引与 view 正确性 | A04 CPU `CONCAT`、A02 CUDA `CPY`、B01 CPU/CUDA `CLAMP` | 已验证并提交为 `d5ae271`；当前 Nix CUDA devShell，CPU 与 RTX 5060 |
 | L2：CUDA 局部修补 | A05 MoE selection NaN、A09 IQ4_NL 短行、A11 ARGSORT CUB alias | 已提交 `6be022a`，见第 6 节。B08 量化 correction 未纳入 |
-| L3：Vulkan 正确性 | B06 matmul stride、B05 FA 边界与 scratch | 已移植并完成本机针对性检查，按用户授权纳入本次提交，见第 7 节。B03 和 D02 紧凑 tile 重组未纳入 |
-| M1：Metal 局部正确性 | A03 CPY stride、A06 TRI NaN/Inf、A07 SOLVE_TRI 尾读 | 待用户提供 macOS 环境，在真实 Metal 设备上验收；不以 Linux 编译/静态检查代替 |
+| L3：Vulkan 正确性 | B06 matmul stride、B05 FA 边界与 scratch | 已提交 `b17420c`，见第 7 节。B03 和 D02 紧凑 tile 重组未纳入 |
+| M1：Metal 局部正确性 | A03 CPY stride、A06 TRI NaN/Inf、A07 SOLVE_TRI 尾读 | LES 已有 `sakura-mac` M5 真机记录；先确认访问、工具链和资源排期，在独立源码/build 目录验收，不以旧 LES 或 Linux 结果代替 |
 | M2：Metal 配套修补 | A12 大偏移、B02 Metal transpose-conv、B03 Metal group norm、B09 FA | 真机内存/shape 与 shader validation；进入批次后按实际依赖拆成可验收子组，不能为了批量而混入整套 FA 重构 |
 | 后续能力与性能批次 | C 类按 backend/算子族分组，再考虑 D 类 | 先证明 omni 图可达，再做数值与性能验证；不将新 kernel 存在写成模型收益 |
 | 独立迁移设计 | E 类公共 API、状态布局和格式 | 不作为上述小修复批次的隐含依赖；需要明确模型需求和跨后端合同 |
 
-macOS 的具体机器、架构、系统/Xcode 版本及访问方式尚未提供，M1/M2 目前不执行。CPU ARM ISA 专用修复须有目标 ISA/dispatch 证据，不能仅因 macOS 可用就视为覆盖。
+后续核对已从 LES 当前记录确认 `sakura-mac` M5 真机线索，不再笼统标为“没有 macOS 环境”。本轮没有连接或运行该机器；M1/M2 需确认访问、系统/Xcode、资源与验收排期，不与 LES 重型 oracle 并发抢占。CPU ARM ISA 专用修复仍须有目标 ISA/dispatch 证据，不能仅因 macOS 可用就视为覆盖。
 
 ## 3. L1 来源与适配说明
 
@@ -320,6 +320,8 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 
 ### 后续建议：仍先做本机能验证的正确性
 
+以下保留候选相对优先级；当前不直接启动下一批，先按第 9 节收口已有成果的集成与发布准备。
+
 1. **下一批优先**：B04 CPU FA（L3 已观察到 F16 reference 未满足常量预期）、A08 Vulkan NVFP4 LUT、B03 的 CPU/Vulkan norm 子项。进入批次后分别核对上游依赖，B03 的 Metal 子项保留待办。
 2. **后续 CUDA 正确性批次**：B08、B07 的 CUDA 子项，然后按依赖拆 B10/B11；同步问题需对应 racecheck/synccheck，不只看普通数值输出。HIP 特有部分不以 CUDA/RADV 测试代替。
 3. **其余本机修补**：B02 CPU、B12 的适用 view/GLU 子项、B13 当前 x86 ISA 可达项；A10 主要服务反向/训练，推理优先级较低。
@@ -328,3 +330,39 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 6. **后置**：D 类须证明实际热点和端到端收益；E 类需要独立迁移设计。需要具体权重模型时再列出用途和资源需求，目前没有新增模型下载需求。
 
 扩展文档 X01–X06 **不计入这53组**，本算子分支未推进其自研/LES 适配；涉及原 LES 工作的疑点须核对该会话最新状态，不能把旧调研位置当作仍未修复的证据。
+
+## 9. 当前确定的集成、发布与下一批方向
+
+当前 LES 检查点为 `81221392bc89eaf0836898d463123e123b3171aa`，算子为 `b17420c347612951dd3832794e1212dec515bbf4`，共同基点仍为 `350a835d5f8215145aa210a7df0f67e8877b5d6e`。
+分步验证的**主记录**在 LES 工作区 `/home/sakura/workspace/llm/llama.cpp-omni/docs/les/HANDOFF.md` 第 6 节 I0–I5；该文件尚不在算子分支中，不复制一份平行集成计划。计划未提交时读取工作区版本，不能以旧 `git show` 内容代替。
+
+**本轮仅调整计划**：没有创建 integration/发布分支、没有 merge、构建或新测试结果，没有提交/推送。已回移植仍为8组，剩余45组仍是候选池，不是发布前必须完成的清单。
+
+### 本算子工作线的交付顺序
+
+1. **配合集成 I0–I4**：冻结 OP-L1/L2/L3；在待建 `integration/les-operators` worktree 从 LES 检查点起逐批 merge，每步先编译并验证对应算子和 LES CPU 回归，再验最终组合的 GPU 同步链与模型数值。原两个分支不互相合并，master 不动；每个实际 merge/提交另需授权。
+2. **并行准备首个最小发布补丁**：优先 A04 CONCAT。其新增量化 case 会暴露 CUDA 旧 supports_op 误接纳，故保留同契约的必要 CUDA F32 dtype 门控及独立 oracle，不机械裁成“只改 CPU 一文件”，也不夹带 CPY/CLAMP。
+3. **独立发布分支验收**：从发 PR 时已核对的 `tc-mb/llama.cpp-omni` master 抽取最小闭环；A04 复用量化各维、独立预期和 ASan，并核对 CUDA 不支持类型的正确拒绝。随后按维护者反馈准备 A09 converter/memcheck/构建门控、B06 四路径/精确 range。不是从整个开发分支直接发合集，也不默认依赖 LES 或 integration。
+4. **再选下一修复批次**：组合 I3/I4 收口后，优先 B04 CPU FA、A08 Vulkan NVFP4 LUT、B03 CPU/Vulkan norm 子项；每项仍核对具体前置/后续修复，不引入 core API、融合或整 backend 重排。其余第 8 节候选保持原相对优先级。
+5. **Metal 独立排期**：在确认机器、构建目录和资源后做 M1；LES G1-M 原始 oracle 与 M1 是两类验收，双方原通过项不能互代。D/E 类继续后置，C类先证明真实图可达。
+
+开发继续按同类小批共享 Nix 构建，**公开 PR 按独立缺陷或同一契约拆分**：
+
+| 发布单元 | 不能随意拆掉的内容 / 边界 |
+|---|---|
+| A04 CONCAT | CPU block 寻址、必要 CUDA dtype 拒绝、fixture 和独立预期 |
+| B01 CLAMP | CPU/CUDA 同一 view 契约及独立预期；保留 omni 原地 API |
+| B06 Vulkan matmul | 四条 MM/MMV/ID 路径、精确 descriptor 范围及 padding/尾 tile 回归 |
+| B05 FA | rowmax 溢出、scratch 失效、MMQ shared 写边界默认按三个缺陷分别准备；每项保留必要路径和检测边界 |
+| A02/A05/A09/A11 | 各自独立修复；真实适配依赖一起纳入，不连带其他批次代码 |
+
+先准备并人工审阅一个小 PR，根据反馈继续；不同时批量创建所有候选。公开差异保留必要源码、测试和使用/来源说明，长调研与本机取证路径留在 fork。
+每项状态区分“开发已实现、独立验收、组合验收、PR准备/发布、上游合入”，不因本机通过或一次 squash 自动升级为已交付。
+PR 目标是 `tc-mb/llama.cpp-omni`，`ggml-org/llama.cpp` 是补丁来源。提交前重新检查目标 base、已有 PR、适用 CI 与贡献规范；人类提交者负责审阅、解释和如实披露 AI 辅助，发布仍另行授权。
+
+### LES 与算子的所有权交接
+
+- R3 就是已完成的 A05，不再另做；R1/R2 分别对应未开展的 A01/B04。
+- D02=O1/Metal O3 tile，D03=O2，D05包含 Metal O3 fusion，D01=O4：是同一候选的不同索引，不另计一次任务。E02/P3 与 LES T5.1 统一设计。
+- 真实 ID/slot、context-owned bank、scheduler、动态 repack 失效与预算归 LES 负责人；context-owned 迁移已经完成，不重做。B05 的临时 RHS scratch 不等于 LES 持久专家缓存，B06 寻址不等于 D02 紧凑 tile。
+- 公共测试文件由集成负责人串行收敛；组合失败先对照独立检查点和基线定位，再将修复交回对应源分支，不在两边分别实现。既有缺陷、回归、未验收组合分开记录，不以范围扩大掩盖失败。
