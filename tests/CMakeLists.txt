@@ -243,6 +243,18 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+if (GGML_CUDA AND TARGET ggml-cuda AND NOT GGML_BACKEND_DL AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
+    # Internal entry points require a linkable backend, and are not exported by Windows shared builds.
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    add_executable(test-cuda-convert test-cuda-convert.cu)
+    target_include_directories(test-cuda-convert PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-cuda-convert PRIVATE ggml-base ggml-cuda CUDA::cudart CUDA::cublas)
+    set_target_properties(test-cuda-convert PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+    llama_test(test-cuda-convert LABEL "cuda")
+    set_tests_properties(test-cuda-convert PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

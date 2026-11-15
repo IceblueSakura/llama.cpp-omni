@@ -17,8 +17,8 @@
 
 | 批次 | 候选范围 | 共享验证环境 / 交付边界 |
 |---|---|---|
-| L1：局部索引与 view 正确性 | A04 CPU `CONCAT`、A02 CUDA `CPY`、B01 CPU/CUDA `CLAMP` | 当前 Nix CUDA devShell，CPU 与 RTX 5060；逐项红绿验证后合跑相关算子 |
-| L2：CUDA 局部修补 | A05 MoE selection NaN、A09 IQ4_NL 短行、A11 ARGSORT CUB alias | 复用 L1 环境；各自确认实际 dispatch，涉及边界访问时使用 memcheck。B08 量化 correction 单独核清配套后再决定是否加入 |
+| L1：局部索引与 view 正确性 | A04 CPU `CONCAT`、A02 CUDA `CPY`、B01 CPU/CUDA `CLAMP` | 已验证并提交为 `d5ae271`；当前 Nix CUDA devShell，CPU 与 RTX 5060 |
+| L2：CUDA 局部修补 | A05 MoE selection NaN、A09 IQ4_NL 短行、A11 ARGSORT CUB alias | 已移植并完成本机针对性验证，按用户授权纳入本批提交，见第 6 节。B08 量化 correction 未纳入 |
 | L3：Vulkan 正确性 | B06 matmul stride、B05 FA 边界与 scratch；B03 Vulkan 部分按依赖加入 | 独立 Vulkan build，validation；覆盖 MM/MMV/ID 及 scratch 复用链。不混入 D02 紧凑 tile 重组 |
 | M1：Metal 局部正确性 | A03 CPY stride、A06 TRI NaN/Inf、A07 SOLVE_TRI 尾读 | 待用户提供 macOS 环境，在真实 Metal 设备上验收；不以 Linux 编译/静态检查代替 |
 | M2：Metal 配套修补 | A12 大偏移、B02 Metal transpose-conv、B03 Metal group norm、B09 FA | 真机内存/shape 与 shader validation；进入批次后按实际依赖拆成可验收子组，不能为了批量而混入整套 FA 重构 |
@@ -117,7 +117,7 @@ build-operators-asan/bin/test-backend-ops test -b CPU -o CLAMP -p 'v=1' -j 1
 | CPU ASan：五种量化类型、四个 CONCAT 维度 | **20/20**，无 ASan 报错，exit 0 |
 | CPU ASan：CLAMP view | **2/2**，无 ASan 报错，exit 0 |
 
-本批代码与针对性验证已完成，用户已授权提交至 `fix/upstream-operators`，不合并到 master。只检查变更相关算子，不声称模型图、性能、HIP/MUSA、Vulkan 或 Metal 已验收。两项独立只读依赖/测试审查均已完成，其适用性判断已由上述红绿检查复核。
+本批代码与针对性验证已完成，按用户授权提交至 `fix/upstream-operators`：`d5ae271f09c3e5ed1140408b28b7564c355451ca`，含作者匹配的 DCO sign-off，不合并到 master。只检查变更相关算子，不声称模型图、性能、HIP/MUSA、Vulkan 或 Metal 已验收。两项独立只读依赖/测试审查均已完成，其适用性判断已由上述红绿检查复核。
 
 ### 本地证据
 
@@ -128,6 +128,73 @@ build-operators-asan/bin/test-backend-ops test -b CPU -o CLAMP -p 'v=1' -j 1
 - `build-operators-cuda/evidence/l1-green.log`
 - `build-operators-cuda/evidence/l1-memcheck.log`
 - `build-operators-cuda/evidence/l1-asan.log`
-- `build-operators-cuda/evidence/l1-sources.b3`：本批 5 个源码/测试文件的 BLAKE3 快照；从 worktree 根目录运行 `b3sum -c build-operators-cuda/evidence/l1-sources.b3` 核对。
+- `build-operators-cuda/evidence/l1-sources.b3`：L1 的 5 个源码/测试文件 BLAKE3 快照；在 L1 提交对应的 checkout 根目录运行 `b3sum -c` 核对，后续批次改变同一文件后不再匹配是预期行为。
 
 上述 job 保存时均 `captureComplete=true`。日志是本地验证产物，不纳入源码提交；清理构建目录会删除这些产物。L1 源码、测试和调研/执行文档一起纳入本批提交，master 保持不变；提交号以 Git 历史为准。
+
+## 6. L2：本机 CUDA 局部修补
+
+基点为 L1 `d5ae271f09c3e5ed1140408b28b7564c355451ca`，复用上述 Nix 环境和 RTX 5060。状态：**已完成针对性验证，按用户授权提交至 fork 工作分支**；不推送或移动 master，提交号以 Git 历史为准。不需要额外 GGUF/权重模型；不扩展到 B08、Metal 或新模型能力。
+
+### 来源与最小适配
+
+| 候选 | 完整上游 commit / PR | 改动与依赖 |
+|---|---|---|
+| A05 | `10d4846a572aebf21c0482d140b00e74c0f1ad20` / #31005 | 原样补入 post-bias selection NaN → `-FLT_MAX`。当前融合路径已存在，无新增融合前置 |
+| A09 | `f872b591121761ac7b2af18283bd99bdc092a63a` / #29683 | 将实际 32 元素 block 数传入 kernel，越界 sub-block 提前返回。omni 尚未采用上游抽取的 dequantize helper，故在原 kernel 内加入同等边界保护，保留既有布局与计算 |
+| A11 | `b23701f77d47dad9de834d59ebfcbe25c9e8b46f` / #28389 | 原样补入独立 `temp_keys_out`，覆盖 6 种 CUB 调用分支的 size-query/execute。额外 scratch 为 `ncols*nrows*sizeof(float)`，另有 pool 对齐；不引入后续排序策略优化 |
+
+本机锁定的 CCCL `cub/device/device_radix_sort.cuh` 明确要求输入、输出 ranges 不重叠；不能将当前设备偶然执行成功当作允许 alias 的依据。
+
+### 测试选择与运行证据
+
+- A05：扩展现有 `test_topk_moe`，4 个 logits 全 0、selection bias 全 NaN，sigmoid 权重为 0.5、选择全部 4 个专家。沿用 CPU reference 检查 IDs 集合及 weights，避免依赖跨后端 NaN 排序顺序。普通 GDB 在修复前、后均记录 `ggml_cuda_try_fuse → ggml_cuda_op_topk_moe` 命中；修复前失败，修复后通过，关闭 fusion 的对照也通过。
+- A09：新增窄范围 `test-cuda-convert`，直接调用实际 F32/F16 converter，以精确 `cudaMalloc` 分配验证 `k={32,64,96,256,288}`。独立 CPU 解量化 stored input 作为预期。普通 CPY 使用不同路径，backend pool padding 也可能掩盖越界，因此不以它们代替此测试。该测试只在可链接的 native CUDA backend 上构建，排除 `GGML_BACKEND_DL` 及 Windows shared；无设备返回 CTest skip 77，其他 CUDA 初始化错误仍失败。
+- A11：复用 ARGSORT CPU reference，修正已有大行循环遗漏 `order` 参数的测试盲区，增加 248k 单/双行升降序。修复前本机 4/4 通过，**未复现上游的间歇性损坏**；修复后继续通过，不编造红绿结论。
+- A11 另用本地小张量 probe 对同一图连续计算 3 次，覆盖普通执行、capture 和 replay，核对排序索引与源数据保持不变。4 组形状/方向共 12 次检查通过；GDB 记录各组 `capture=0/1` 且 `temp_keys != temp_keys_out`。probe、调试命令和日志只保留在本地 evidence 目录，不向生产代码添加 instrumentation。
+- 辅助审查状态：MoE 子任务完成；IQ4_NL 子任务未成功返回，未将其当作证据。IQ4_NL 的调用链、精确分配复现和数值/memcheck 验证由主会话完成。
+
+| 检查 | 实际结果 |
+|---|---|
+| 修复前 MoE NaN | **0/1**，exit 1；融合入口实际命中 |
+| 修复前 IQ4_NL memcheck | `k=32` 实际越界读取，30 errors（仅打印前 8 项），exit 99；未继续执行其余 case |
+| 修复前 ARGSORT 248k | **4/4**，exit 0，本机未复现间歇性错误 |
+| 修复后 CUDA ARGSORT / TOPK_MOE / NaN 回归 | **295/295**，exit 0 |
+| 修复后关闭 fusion 的 NaN 对照 | **1/1**，exit 0 |
+| 修复后 IQ4_NL converter memcheck | **10/10**，0 errors，exit 0 |
+| 修复后 MoE NaN / ARGSORT 聚焦 memcheck | **7/7**，0 errors，exit 0；包括 4 个 248k、2 个小尺寸排序和 1 个 MoE NaN 用例 |
+| 新转换测试 CTest 注册/运行 | **1/1** test 通过，内部 10 个 conversion case 实际运行 |
+| ARGSORT 同图 capture/replay probe | **12/12**，单/双行、升/降序均观察到 capture 与独立 keys 缓冲区 |
+| CPU-only / CUDA dynamic-backend CMake | 配置、生成成功；dynamic-backend 的转换测试注册为 0 项，未构建或运行该模式的 CUDA backend |
+
+首次修复后 memcheck 虽然 10/10 数值通过，但报了一条 `Selective device code recompilation in progress` API warning 并 exit 99，未当成绿色结果。同一二进制缓存预热后原命令 0 errors，最终完整检查也 0 errors。两个日志均保留。CUDA-GDB 13.4 的设备断点尝试在初始化时因 protobuf 错误中止，未取得 device breakpoint 证据；随后使用普通 GDB 获取上述 host dispatch 及 capture/缓冲区证据，无需更改主机调试器配置。
+
+### 复验命令与本地证据
+
+在第 4 节的 devShell 中执行，保留相同的 `LD_LIBRARY_PATH`：
+
+```bash
+cmake --build build-operators-cuda --target test-backend-ops test-cuda-convert -j 6
+unset GGML_CUDA_DISABLE_FUSION
+build-operators-cuda/bin/test-backend-ops test -b CUDA0 \
+  -o ARGSORT,TOPK_MOE,TOPK_MOE_POST_BIAS_NAN -j 1
+GGML_CUDA_DISABLE_FUSION=1 build-operators-cuda/bin/test-backend-ops test \
+  -b CUDA0 -o TOPK_MOE_POST_BIAS_NAN -j 1
+compute-sanitizer --tool memcheck --error-exitcode 99 build-operators-cuda/bin/test-cuda-convert
+compute-sanitizer --tool memcheck --error-exitcode 99 \
+  build-operators-cuda/bin/test-backend-ops test -b CUDA0 \
+  -o TOPK_MOE_POST_BIAS_NAN,ARGSORT \
+  -p 'ne=\[(4,1,1,1|248000,1,1,1|248000,2,1,1)\]' -j 1
+ctest --test-dir build-operators-cuda -R '^test-cuda-convert$' --output-on-failure
+```
+
+`build-operators-cuda/evidence/` 中保留：
+
+- `l2-red.log`：修复前构建/三项检查。
+- `l2-green-initial.log`、`l2-green.log`：首次 instrumentation warning 与最终检查。
+- `l2-dispatch-red.log`、`l2-dispatch-green.log`：融合入口及 CUB 普通/capture 分支证据。
+- `l2-cmake.log`：最终 native CUDA 测试及 CPU-only / dynamic-backend 配置检查。
+- `l2-argsort-graph.cpp`、`l2-argsort-dispatch.gdb`、`l2-moe-host-dispatch.gdb`：本地 probe / 调试命令。
+- `l2-sources.b3`：本批 6 个源码/测试文件快照；从 worktree 根目录用 `b3sum -c` 核对。
+
+所有性能收益均未测量；本批是正确性回移植，不据小张量验收声称模型加速或覆盖其他硬件。下一批继续优先考虑本机可验证的 Vulkan 正确性候选。
