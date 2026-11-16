@@ -25,6 +25,7 @@
 #include <array>
 #include <cfloat>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -4122,6 +4123,58 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Cover raw NVFP4 scale bytes, including encodings the ordinary quantizer never emits.
+struct test_mul_mat_nvfp4_scales : public test_mul_mat {
+    test_mul_mat_nvfp4_scales(int64_t n)
+        : test_mul_mat(GGML_TYPE_NVFP4, GGML_TYPE_F32, 256, n, 256, {1, 1}, {1, 1}) {}
+
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_NVFP4_SCALES"; }
+    bool run_whole_graph() override { return true; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        auto a = ggml_get_tensor(ctx, "a");
+        auto b = ggml_get_tensor(ctx, "b");
+        const size_t block_bytes = ggml_type_size(type_a);
+        const int64_t block_size = ggml_blck_size(type_a);
+        // Each block starts with one scale per 16 values; nibble 2 encodes one.
+        std::vector<uint8_t> data(ggml_nbytes(a), 0x22);
+        for (int64_t row = 0; row < m; row++) {
+            for (int64_t block = 0; block < k / block_size; block++) {
+                for (int64_t scale = 0; scale < block_size / 16; scale++) {
+                    data[row*a->nb[1] + block*block_bytes + scale] = uint8_t(row);
+                }
+            }
+        }
+        ggml_backend_tensor_set(a, data.data(), 0, data.size());
+        std::vector<float> rhs(k*n, 0);
+        for (int64_t col = 0; col < n; col++) {
+            // Q8 RHS conversion is exact: its scale is 127/127 = 1.
+            rhs[col*k + 16*col] = 127;
+        }
+        ggml_backend_tensor_set(b, rhs.data(), 0, rhs.size()*sizeof(float));
+    }
+
+    double err(const float * a, const float * b, size_t count) override {
+        for (size_t i = 0; i < count; i++) {
+            const unsigned code = i % m;
+            const unsigned exponent = (code >> 3) & 15;
+            const unsigned mantissa = code & 7;
+            const float scale = code == 0 || code == 127 ? 0.0f
+                : exponent == 0 ? std::ldexp(float(mantissa), -9)
+                : std::ldexp(1.0f + float(mantissa)/8, int(exponent) - 7);
+            const float expected = 127*scale;
+            const float tolerance = std::max(1e-4f, expected*1e-3f);
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i]) ||
+                fabsf(a[i] - expected) > tolerance || fabsf(b[i] - expected) > tolerance) {
+                printf("NVFP4 scale 0x%02x: got %g / %g, expected %g ", code, a[i], b[i], expected);
+                return 1.0;
+            }
+        }
+        return 0.0;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -6733,6 +6786,10 @@ struct test_flash_attn_constant : public test_flash_attn_ext {
                               quantized ? GGML_TYPE_F16 : GGML_TYPE_F32),
           value(quantized ? 1.0f : 4096.0f) {}
 
+    test_flash_attn_constant(int64_t hsv, int64_t kv, int64_t nb, ggml_type type, float value, float softcap)
+        : test_flash_attn_ext(64, hsv, 1, {1, 1}, kv, nb, false, false, 0, softcap, GGML_PREC_F32, type, type),
+          value(value) {}
+
     std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_CONSTANT"; }
     bool run_whole_graph() override { return true; }
 
@@ -6745,7 +6802,8 @@ struct test_flash_attn_constant : public test_flash_attn_ext {
 
     double err(const float * a, const float * b, size_t n) override {
         for (size_t i = 0; i < n; i++) {
-            if (fabsf(a[i] - value) > value*1e-3f || fabsf(b[i] - value) > value*1e-3f) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i]) ||
+                fabsf(a[i] - value) > value*1e-3f || fabsf(b[i] - value) > value*1e-3f) {
                 printf("constant attention index %zu: got %g / %g, expected %g ", i, a[i], b[i], value);
                 return 1.0;
             }
@@ -6757,19 +6815,20 @@ struct test_flash_attn_constant : public test_flash_attn_ext {
 // Keep both matmuls in one compute call: FA/large softmax overwrite the shared RHS conversion scratch.
 struct test_matmul_scratch_reuse : public test_case {
     const bool flash;
+    const int64_t n;
     std::vector<float> expected;
 
-    test_matmul_scratch_reuse(bool flash) : flash(flash) {}
+    test_matmul_scratch_reuse(bool flash, int64_t n = 32) : flash(flash), n(n) {}
 
-    std::string vars() override { return VARS_TO_STR1(flash); }
+    std::string vars() override { return VARS_TO_STR2(flash, n); }
     std::string op_desc(ggml_tensor *) override { return "MATMUL_SCRATCH_REUSE"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 1e-7; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        auto backing = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 32);
+        auto backing = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, n);
         ggml_set_name(backing, "x_backing");
-        auto x = ggml_view_2d(ctx, backing, 128, 32, backing->nb[1], 0);
+        auto x = ggml_view_2d(ctx, backing, 128, n, backing->nb[1], 0);
         ggml_set_name(x, "x");
         auto one = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 128, 128);
         auto two = ggml_dup_tensor(ctx, one);
@@ -6780,12 +6839,12 @@ struct test_matmul_scratch_reuse : public test_case {
         if (flash) {
             auto k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, 2048, 1);
             auto v = ggml_dup_tensor(ctx, k);
-            auto mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 2048, 32);
+            auto mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 2048, n);
             ggml_set_name(k, "k");
             ggml_set_name(v, "v");
             ggml_set_name(mask, "mask");
             interference = ggml_flash_attn_ext(ctx, first, k, v, mask, 1.0f/sqrtf(128.0f), 0, 0);
-            interference = ggml_reshape_2d(ctx, interference, 128, 32);
+            interference = ggml_reshape_2d(ctx, interference, 128, n);
         } else {
             auto padded = ggml_pad(ctx, first, 16385 - 128, 0, 0, 0);
             interference = ggml_repeat(ctx, ggml_sum_rows(ctx, ggml_soft_max(ctx, padded)), first);
@@ -6798,7 +6857,7 @@ struct test_matmul_scratch_reuse : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         test_case::initialize_tensors(ctx);
-        std::vector<float> data(256*32);
+        std::vector<float> data(256*n);
         for (size_t i = 0; i < data.size(); i++) {
             data[i] = float(int(i % 17) - 8) / 16.0f;
         }
@@ -9325,8 +9384,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_flash_attn_constant(false));
     test_cases.emplace_back(new test_flash_attn_constant(true));
+    test_cases.emplace_back(new test_flash_attn_constant(64, 64, 2, GGML_TYPE_F16, 4096, 0));
+    test_cases.emplace_back(new test_flash_attn_constant(67, 64, 2, GGML_TYPE_F16, 4096, 0));
+    test_cases.emplace_back(new test_flash_attn_constant(64, 17, 64, GGML_TYPE_F16, 1, 1));
     test_cases.emplace_back(new test_matmul_scratch_reuse(false));
     test_cases.emplace_back(new test_matmul_scratch_reuse(true));
+    test_cases.emplace_back(new test_matmul_scratch_reuse(true, 4096));
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
@@ -9832,6 +9895,12 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         case MODE_GRAD:
         case MODE_SUPPORT:
             test_cases = make_test_cases_eval();
+            // Raw scale encodings follow the CPU/Vulkan decoding contract.
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "Vulkan") == 0) {
+                test_cases.emplace_back(new test_mul_mat_nvfp4_scales(1));
+                test_cases.emplace_back(new test_mul_mat_nvfp4_scales(16));
+            }
             break;
         case MODE_PERF:
             test_cases = make_test_cases_perf();
