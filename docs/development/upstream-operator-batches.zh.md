@@ -337,7 +337,7 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 原集成冻结输入仍为 LES `81221392bc89eaf0836898d463123e123b3171aa` 与算子 `b17420c347612951dd3832794e1212dec515bbf4`，共同基点 `350a835d5f8215145aa210a7df0f67e8877b5d6e`。后续算子增量已同步回源分支 `b97676b`，其源码/测试与审阅候选 `c826b17` 相同；这些新增改动未自动带入 LES 或原集成源码，不借旧模型结果外推。
 分步验证的**计划**在 LES 工作区 `/home/sakura/workspace/llm/llama.cpp-omni/docs/les/HANDOFF.md` 第 6 节 I0–I5；随后逐步执行的**唯一结果记录**在独立 `integration/les-operators` 分支的同名文件，工作区 `/home/sakura/workspace/llm/llama.cpp-omni-integration`。可用 `git show integration/les-operators:docs/les/HANDOFF.md` 读取，不在算子源分支复制平行执行记录。
 
-组合 I0–I4、先行候选及后续扩充的精确范围、输入与结果见上述集成记录。本算子源分支没有合入 LES 生产代码，只有纯代码候选推到 fork 审阅，未创建 PR；当前剩余43组未开展和B04部分项不是发布前必须全部完成的清单。
+组合 I0–I4、先行候选及后续扩充的精确范围、输入与结果见上述集成记录。本算子源分支没有合入LES生产代码，纯代码候选现为 [Draft PR #156](https://github.com/tc-mb/llama.cpp-omni/pull/156)，未Ready/合入；剩余43组未开展和B04部分项不是本PR必须全部完成的清单。
 
 ### 本算子工作线的交付顺序
 
@@ -358,7 +358,7 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 | A08/B04部分 | NVFP4全部scale及内存预算；CPU F32累加与softcap padding，保留原dispatch/tail边界 |
 | A02/A05/A09/A11 | 同包内各自保留来源、适配依赖与独立测试，不带入本包以外的候选 |
 
-先人工审阅这一个综合候选，不批量创建所有剩余候选 PR。包内保留可拆提交，维护者如要求再拆，不为扩大粒度加入未核对或未测项。公开差异保留必要源码、测试和来源，长调研与本机取证路径留在 fork；当前 fork 更新已获授权，创建 PR/合并仍另行授权。
+当前一个Draft用于协调范围，不批量创建剩余候选PR。包内保留可拆提交，维护者如要求再拆，不为扩大粒度加入未核对或未测项。公开差异保留必要源码、测试和来源，长调研与本机取证路径留在fork；创建此次Draft已有明确授权，Ready/合并仍另行确认。
 每项状态区分“开发已实现、独立验收、组合验收、PR准备/发布、上游合入”，不因本机通过或一次 squash 自动升级为已交付。
 PR 目标是 `tc-mb/llama.cpp-omni`，`ggml-org/llama.cpp` 是补丁来源。提交前重新检查目标 base、已有 PR、适用 CI 与贡献规范；人类提交者负责审阅、解释和如实披露 AI 辅助，发布仍另行授权。
 
