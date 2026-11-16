@@ -1,6 +1,8 @@
 # 上游算子修复分批执行记录
 
-日期：2026-11-15。工作目录：`/home/sakura/workspace/llm/llama.cpp-omni-operators`，分支：`fix/upstream-operators`。
+最初记录：2026-11-15；工作区收敛：2026-11-16。工作目录：`/home/sakura/workspace/llm/llama.cpp-omni-operators`，分支：`fix/upstream-operators`。
+
+**下一步默认开发入口就是本 worktree / 分支。** 当前角色、归档恢复、CI/CD后置及下一任务见[第10节](#10-工作区收敛与下一步入口2026-11-16)；不从 LES、PR 或已撤下的旧集成 worktree 继续日常回移植。
 
 ## 1. 依据与批次边界
 
@@ -9,7 +11,7 @@
 - 候选及稳定 ID 见 [上游算子调研](upstream-operator-survey.zh.md)；没有直接上游方案的事项见 [扩展调研](upstream-operator-extensions.zh.md)，不混入本执行队列。
 - 按同类契约、共享构建与设备分批移植和验收，不要求每项重建整个环境。每项保留来源、必要依赖和测试结果；批次不等于不可拆分的大提交。
 - 只移植当前批次所需的修复、测试及最小前置依赖。不为套用上下文引入性能优化、公共 API 或整个后端更新。
-- 算子实现不修改原 LES 源码或历史；当前用户确认的联动仅调整双方计划文档。不自动提交、推送或发布，合并到 master 前由用户审查并决定。当前分步集成与发布顺序见第 9 节。
+- 算子实现不修改原LES生产代码；已授权的实现按步骤验证并提交，公开分支只提取对应代码/测试，master不动。当前阶段以算子回移为主，CI/CD修复单独后置；当前入口及权限边界见第10节。
 
 ## 2. 推荐队列
 
@@ -335,14 +337,14 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 ## 9. 当前确定的集成、发布与下一批方向
 
 原集成冻结输入仍为 LES `81221392bc89eaf0836898d463123e123b3171aa` 与算子 `b17420c347612951dd3832794e1212dec515bbf4`，共同基点 `350a835d5f8215145aa210a7df0f67e8877b5d6e`。后续算子增量已同步回源分支 `b97676b`，其源码/测试与审阅候选 `c826b17` 相同；这些新增改动未自动带入 LES 或原集成源码，不借旧模型结果外推。
-分步验证的**计划**在 LES 工作区 `/home/sakura/workspace/llm/llama.cpp-omni/docs/les/HANDOFF.md` 第 6 节 I0–I5；随后逐步执行的**唯一结果记录**在独立 `integration/les-operators` 分支的同名文件，工作区 `/home/sakura/workspace/llm/llama.cpp-omni-integration`。可用 `git show integration/les-operators:docs/les/HANDOFF.md` 读取，不在算子源分支复制平行执行记录。
+历史 I0–I5 计划在 LES `docs/les/HANDOFF.md`，执行记录保存在 `integration/les-operators` 分支同名文件，可用 `git show integration/les-operators:docs/les/HANDOFF.md` 读取。该旧 worktree 已归档撤下，不再作为当前写入入口。收敛后，**算子当前进度/下一步以本文件为主记录**；历史组合流水不复制、不追记为当前运行时通过。
 
 组合 I0–I4、先行候选及后续扩充的精确范围、输入与结果见上述集成记录。本算子源分支没有合入LES生产代码，纯代码候选现为 [Draft PR #156](https://github.com/tc-mb/llama.cpp-omni/pull/156)，未Ready/合入；剩余43组未开展和B04部分项不是本PR必须全部完成的清单。
 
 ### 本算子工作线的交付顺序
 
 1. **配合集成 I0–I4**：冻结 OP-L1/L2/L3；在待建 `integration/les-operators` worktree 从 LES 检查点起逐批 merge，每步先编译并验证对应算子和 LES CPU 回归，再验最终组合的 GPU 同步链与模型数值。原两个分支不互相合并，master 不动；每个实际 merge/提交另需授权。
-2. **当前综合发布包**：用户允许继续修正并追加已验证上游算子修复。`pr/ggml-operator-correctness@c826b17` 当前5个提交，英文全文后中文全文，完整 upstream ID，末尾各一份 AI assistance 和 Signed-off-by，不携带本地批次序号；先行 CONCAT 分支已删除，旧目录 detached 保留取证。
+2. **当前综合发布包**：用户允许继续修正并追加已验证上游算子修复。`pr/ggml-operator-correctness@c826b17` 当前5个提交，英文全文后中文全文，完整 upstream ID，末尾各一份 AI assistance 和 Signed-off-by，不携带本地批次序号；先行 CONCAT 分支和worktree已移除，9954c4a及其构建/取证由本地bundle和归档保留。
 3. **独立发布分支验收**：当前16个源码/测试文件、672行新增/142行删除，不含 LES、长调研文档、新能力或未验收的性能重排。修复前后数值及 Vulkan 同步红绿证据已独立完成；Metal仅源级保护，尚未宣称 Mac 编译/运行通过。详情在 integration HANDOFF 第6节维护。
 4. **再选下一修复批次**：B03 CPU/Vulkan norm 或后续 CUDA 正确性子项；每项核对前置/后续依赖，仍不引入 core API、融合或整 backend 重排。其余第8节候选保持相对优先级。
 5. **Metal 独立排期**：在确认机器、构建目录和资源后做 M1；LES G1-M 原始 oracle 与 M1 是两类验收，双方原通过项不能互代。D/E 类继续后置，C类先证明真实图可达。
@@ -368,3 +370,33 @@ PR 目标是 `tc-mb/llama.cpp-omni`，`ggml-org/llama.cpp` 是补丁来源。提
 - D02=O1/Metal O3 tile，D03=O2，D05包含 Metal O3 fusion，D01=O4：是同一候选的不同索引，不另计一次任务。E02/P3 与 LES T5.1 统一设计。
 - 真实 ID/slot、context-owned bank、scheduler、动态 repack 失效与预算归 LES 负责人；context-owned 迁移已经完成，不重做。B05 的临时 RHS scratch 不等于 LES 持久专家缓存，B06 寻址不等于 D02 紧凑 tile。
 - 公共测试文件由集成负责人串行收敛；组合失败先对照独立检查点和基线定位，再将修复交回对应源分支，不在两边分别实现。既有缺陷、回归、未验收组合分开记录，不以范围扩大掩盖失败。
+
+## 10. 工作区收敛与下一步入口（2026-11-16）
+
+用户选择“算子主线，保留3个工作区”。本次只收敛本地目录与职责，没有合并LES/算子、修改CI配置、移动master或更新远端。
+
+| 角色 | Worktree | 分支 / 规则 |
+|---|---|---|
+| **唯一日常开发入口** | `/home/sakura/workspace/llm/llama.cpp-omni-operators` | **`fix/upstream-operators`**；新增上游核对、源码、测试、执行记录及分步提交在这里完成 |
+| PR审阅/发布快照 | `/home/sakura/workspace/llm/llama.cpp-omni-pr-operators` | `pr/ggml-operator-correctness`，目前 `c826b17` / [Draft #156](https://github.com/tc-mb/llama.cpp-omni/pull/156)；不直接作为日常开发分支，完成独立验收后再显式更新纯代码快照 |
+| LES冻结及公共Git目录 | `/home/sakura/workspace/llm/llama.cpp-omni` | `feat/les-backend-cache`；生产代码保持8122139阶段，只更新必要交接索引，不开展T2或混入算子 |
+
+当前算子生产代码与 `c826b17` 相同，检查点 `b97676b`；精确后续tip用 `git log/status` 查，不在本文自引用文档提交SHA。当前9组完整、B04部分、43组未开展；53组仍是候选池，不隐含全部实施。
+
+### 已撤下的两个 worktree
+
+受限归档根目录：`/home/sakura/workspace/llm/llama.cpp-omni-local-archive/`，每组有 README、bundle、FILES.json、BLAKE3SUMS、VERIFY.txt：
+
+- `retired-worktrees/integration-les-operators-b62ce0d/`：保留原 `b62ce0de8835277074276edd267db79a009c763b`；**`integration/les-operators` 分支引用仍保留**，但旧目录已撤下。其运行时代码不包含最新算子增量，不能当作当前组合版本。
+- `retired-worktrees/concat-review-9954c4a/`：保留原 detached `9954c4a200dd6b9fdea27805474df5bd6fc6e7c0`；没有重建已删除的旧PR分支。
+
+全部 ignored 构建/取证已原子迁移，4554个普通文件和54个符号链接校验一致，未丢弃构建数据。两个base-dependent bundle均在隔离仓库中恢复到原commit/tree，`git fsck --full`通过。恢复要求基点 `350a835d5f8215145aa210a7df0f67e8877b5d6e` 存在；按归档README恢复原绝对路径后才能考虑复用CMake缓存，依赖可能仍需重建。归档不等于释放这些产物的空间。
+
+### 阶段规则与下一任务
+
+1. **CI/CD修复后置为独立阶段**，在选定算子回移阶段收尾后再切换；本次不改workflow、不关闭或重跑远端CI、不把已知基线CI问题当作本地回移阻塞。以后正常更新PR可能自动触发CI，不代表已切到CI修复阶段。已观察的 `is_host_addressable` 初始化和旧 `llama-server` target问题保留待后续归因处理，不在本轮顺带修复。
+2. 每个新算子仍要有本地定向构建、独立预期、适用的红绿及检测；CI后置不是跳过算子验证，也不能把新的实现错误一概推给CI。
+3. **建议下一任务为B03的CPU/Vulkan norm子项**：先对照 `72a926917`、`80d2c0c2c` 等实际diff、依赖与旧实现，选择可验证的最小子集，覆盖非连续输入、batch和尾行；Metal GROUP_NORM仍待目标环境。此次收敛没有开始这项实现。
+4. 后续再按证据评估B08、B07的CUDA子项；HIP/ARM/Metal不以本机结果代验，性能组织与公共API仍不混入当前正确性组。
+5. `build-operators-*` 中有历史产物，首次使用前增量重建受影响target并重新绑定源码身份；不借其他worktree旧二进制作为新改动通过证据。最新已验收产物和原始红绿仍在保留的PR worktree `build-pr-vulkan/evidence/extension/`。
+6. 以后需要组合LES时，从保留的集成分支恢复独立worktree，显式刷新输入并重跑有影响的组合检查；不要将两个源功能分支互相合并，也不把LES带入算子PR。
