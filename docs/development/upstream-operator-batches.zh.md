@@ -296,33 +296,34 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 
 这些检查不等于完整 Vulkan suite、模型端到端性能或 Metal 验收；本批没有测量加速比。
 
-## 8. L3 提交时的整体进度与剩余候选
+## 8. 当前整体进度与剩余候选
 
-统计单位为主调研的稳定候选 ID，不是 commit 数、后端数或工时。53 组候选中，**8 组已回移植并完成已记录的针对性检查，45 组尚未开展**；不存在已修改代码、尚未收口的其他候选。这里的“已回移植”不表示所有平台、模型和检测手段均已验收，尤其保留 B05 shared-memory 动态检测缺口和 A11 本机未复现旧故障的说明。
+统计单位为主调研的稳定候选 ID，不是 commit 数、后端数或工时。截至2026-11-16，53组中 **9组完整移植、B04部分移植、43组尚未开展**。A08 本轮完成；B04 完成 F32 累加与 softcap/padding 正确性子项，未引入非向量 head tiled dispatch/SIMD tail 扩展，不计为完整候选。这里的“已回移植”不表示所有平台、模型和检测手段均已验收，尤其保留 B05 shared-memory 动态检测缺口和 A11 本机未复现旧故障的说明。
 
 | 批次 | 候选 ID | 提交 |
 |---|---|---|
 | L1 | A02、A04、B01 | `d5ae271f09c3e5ed1140408b28b7564c355451ca` |
 | L2 | A05、A09、A11 | `6be022af5c33acd262d754f7e76d2200d64a9411` |
-| L3 | B05、B06 | 本次 `ggml-vulkan: apply batch L3 correctness fixes` 提交 |
+| L3 | B05、B06 | `b17420c347612951dd3832794e1212dec515bbf4` |
+| 后续正确性 | A08、B04部分；A04/B05依赖补齐 | 源分支 `b97676b`；纯代码审阅候选 `c826b17` |
 
-### 剩余清单（完整 ID）
+### 尚未完整移植的清单（完整 ID）
 
-| 分类 | 已移植 / 总数 | 尚未开展 |
+| 分类 | 已移植 / 总数 | 尚未完整移植 |
 |---|---|---|
-| A：单后端局部修补 | 5 / 12 | A01 ARM tile；A03 Metal CPY；A06 TRI；A07 SOLVE_TRI；A08 Vulkan NVFP4 scale LUT；A10 CPU 反向算子 alias；A12 Metal 64-bit offset |
-| B：配套正确性/helper | 3 / 13 | B02 transpose-conv；B03 norm；B04 CPU FA；B07 CUDA/HIP MMF/MMID；B08 CUDA 量化 correction；B09 Metal FA；B10 CUDA FA/norm/softmax 同步；B11 大 grid；B12 view/GLU；B13 CPU ISA/helper |
+| A：单后端局部修补 | 6 / 12 | A01 ARM tile；A03 Metal CPY；A06 TRI；A07 SOLVE_TRI；A10 CPU 反向算子 alias；A12 Metal 64-bit offset |
+| B：配套正确性/helper | 3 / 13，另1组部分完成 | B02 transpose-conv；B03 norm；B04剩余非向量 head tiled扩展；B07 CUDA/HIP MMF/MMID；B08 CUDA 量化 correction；B09 Metal FA；B10 CUDA FA/norm/softmax 同步；B11 大 grid；B12 view/GLU；B13 CPU ISA/helper |
 | C：backend/类型能力补齐 | 0 / 10 | C01–C10：池化、reflect pad、Metal PAD、SET_ROWS/BF16、卷积/IM2COL、GDN/GLA、OpenCL/WebGPU、量化快路及训练算子 |
 | D：性能组织变化 | 0 / 10 | D01–D10：CPU tiled、紧凑专家 tile、MMQ/少行 matmul、routing/reduce/top-k/FA 融合、ARM repack、移动端及布局/归约优化 |
 | E：公共合同/新能力 | 0 / 8 | E01–E08：precision、跳过 expert ID、RoPE、SSM/GDN 状态、稀疏 FA、新 opcode、模型索引及新格式 |
 
-多后端候选进入实施时按实际子项记录；例如只完成 B02 的 CPU 部分，不能把其 Metal 部分也标记为完成。C–E 是候选池，不是必须全做的既定移植队列；性能组织和公共合同的成本不能按当前8组小修复线性估算。
+多后端/多子项候选按实际完成范围记录；只完成 B02 的 CPU 部分不能把 Metal 部分标为完成，B04也不因完成两个正确性子项而标为整项完成。C–E 是候选池，不是必须全做的既定移植队列；性能组织和公共合同的成本不能按当前小修复线性估算。
 
 ### 后续建议：仍先做本机能验证的正确性
 
-以下保留候选相对优先级；当前不直接启动下一批，先按第 9 节收口已有成果的集成与发布准备。
+以下保留未开展候选相对优先级。用户已授权将经核对、可独立验收的正确性修复追加到同一 PR；本轮先收口 A08/B04 子项，不为扩大包而引入能力或性能重排。
 
-1. **下一批优先**：B04 CPU FA（L3 已观察到 F16 reference 未满足常量预期）、A08 Vulkan NVFP4 LUT、B03 的 CPU/Vulkan norm 子项。进入批次后分别核对上游依赖，B03 的 Metal 子项保留待办。
+1. **下一批优先**：B03 的 CPU/Vulkan norm 子项；B04 剩余优化按实际需求另选，B03 的 Metal 子项仍待目标环境。A08/B04本轮正确性子项的精确来源和红绿证据见 integration HANDOFF 的 I5 更新。
 2. **后续 CUDA 正确性批次**：B08、B07 的 CUDA 子项，然后按依赖拆 B10/B11；同步问题需对应 racecheck/synccheck，不只看普通数值输出。HIP 特有部分不以 CUDA/RADV 测试代替。
 3. **其余本机修补**：B02 CPU、B12 的适用 view/GLU 子项、B13 当前 x86 ISA 可达项；A10 主要服务反向/训练，推理优先级较低。
 4. **能力补齐**：优先评估直接对应 omni 音频路径的 C01 CUDA/Vulkan POOL_1D、C02 Vulkan PAD_REFLECT_1D，再按模型图可达性选择其余 C 类；WebGPU 部分单独验证。
@@ -333,20 +334,20 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 
 ## 9. 当前确定的集成、发布与下一批方向
 
-当前 LES 检查点为 `81221392bc89eaf0836898d463123e123b3171aa`，算子为 `b17420c347612951dd3832794e1212dec515bbf4`，共同基点仍为 `350a835d5f8215145aa210a7df0f67e8877b5d6e`。
+原集成冻结输入仍为 LES `81221392bc89eaf0836898d463123e123b3171aa` 与算子 `b17420c347612951dd3832794e1212dec515bbf4`，共同基点 `350a835d5f8215145aa210a7df0f67e8877b5d6e`。后续算子增量已同步回源分支 `b97676b`，其源码/测试与审阅候选 `c826b17` 相同；这些新增改动未自动带入 LES 或原集成源码，不借旧模型结果外推。
 分步验证的**计划**在 LES 工作区 `/home/sakura/workspace/llm/llama.cpp-omni/docs/les/HANDOFF.md` 第 6 节 I0–I5；随后逐步执行的**唯一结果记录**在独立 `integration/les-operators` 分支的同名文件，工作区 `/home/sakura/workspace/llm/llama.cpp-omni-integration`。可用 `git show integration/les-operators:docs/les/HANDOFF.md` 读取，不在算子源分支复制平行执行记录。
 
-原计划确认时仅调整文档；用户随后授权逐步执行、每步提交。组合 I0–I4 及首个 I5 本地候选的精确范围、输入和结果见上述集成记录；本算子源分支仍保留独立已测代码，没有合入 LES 生产代码。未推送/发布；已回移植仍为8组，剩余45组仍是候选池，不是发布前必须完成的清单。
+组合 I0–I4、先行候选及后续扩充的精确范围、输入与结果见上述集成记录。本算子源分支没有合入 LES 生产代码，只有纯代码候选推到 fork 审阅，未创建 PR；当前剩余43组未开展和B04部分项不是发布前必须全部完成的清单。
 
 ### 本算子工作线的交付顺序
 
 1. **配合集成 I0–I4**：冻结 OP-L1/L2/L3；在待建 `integration/les-operators` worktree 从 LES 检查点起逐批 merge，每步先编译并验证对应算子和 LES CPU 回归，再验最终组合的 GPU 同步链与模型数值。原两个分支不互相合并，master 不动；每个实际 merge/提交另需授权。
-2. **准备当前综合发布包**：用户选择现有 OP-L1–L3 合成一个算子正确性 PR。当前分支 `pr/ggml-operator-correctness` 的三个提交已按修改范围重写为英文全文后中文全文，列完整 upstream ID，末尾各保留一份 AI assistance 和 Signed-off-by，不在公开说明中携带本地批次序号。先行 CONCAT 本地/远端分支已按用户授权删除，旧目录 detached 保留取证；精确 refs 和验证映射见 integration 的 HANDOFF。
-3. **独立发布分支验收**：从已核对的 `tc-mb/llama.cpp-omni` master 提取三批纯源码/测试，保留三批提交及逐项来源；共13个文件，不带 LES、长调研文档、新能力或未测候选。该分支独立构建与复核 CPU/CUDA/Vulkan；具体结果在 integration 的 HANDOFF 第 6 节维护，不用组合通过代替。
-4. **再选下一修复批次**：组合 I3/I4 收口后，优先 B04 CPU FA、A08 Vulkan NVFP4 LUT、B03 CPU/Vulkan norm 子项；每项仍核对具体前置/后续修复，不引入 core API、融合或整 backend 重排。其余第 8 节候选保持原相对优先级。
+2. **当前综合发布包**：用户允许继续修正并追加已验证上游算子修复。`pr/ggml-operator-correctness@c826b17` 当前5个提交，英文全文后中文全文，完整 upstream ID，末尾各一份 AI assistance 和 Signed-off-by，不携带本地批次序号；先行 CONCAT 分支已删除，旧目录 detached 保留取证。
+3. **独立发布分支验收**：当前16个源码/测试文件、672行新增/142行删除，不含 LES、长调研文档、新能力或未验收的性能重排。修复前后数值及 Vulkan 同步红绿证据已独立完成；Metal仅源级保护，尚未宣称 Mac 编译/运行通过。详情在 integration HANDOFF 第6节维护。
+4. **再选下一修复批次**：B03 CPU/Vulkan norm 或后续 CUDA 正确性子项；每项核对前置/后续依赖，仍不引入 core API、融合或整 backend 重排。其余第8节候选保持相对优先级。
 5. **Metal 独立排期**：在确认机器、构建目录和资源后做 M1；LES G1-M 原始 oracle 与 M1 是两类验收，双方原通过项不能互代。D/E 类继续后置，C类先证明真实图可达。
 
-开发继续按同类小批共享 Nix 构建，**当前公开单位按用户选择扩大为全部 L1–L3 的一个算子正确性 PR**。以下改为包内审阅分项，不再表示必须分别打开 PR：
+开发继续按同类小批共享 Nix 构建，**当前按用户选择交付一组已核对、独立验证的算子正确性修改，可在相同边界下追加**。以下是包内审阅分项，不表示必须分别打开 PR：
 
 | 包内分项 | 不能随意丢掉的内容 / 边界 |
 |---|---|
@@ -354,15 +355,16 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 | B01 CLAMP | CPU/CUDA 同一 view 契约及独立预期；保留 omni 原地 API |
 | B06 Vulkan matmul | 四条 MM/MMV/ID 路径、精确 descriptor 范围及 padding/尾 tile 回归 |
 | B05 FA | rowmax 溢出、scratch 失效、MMQ shared 写边界分别说明来源和测试限制，不混为同一种缺陷 |
+| A08/B04部分 | NVFP4全部scale及内存预算；CPU F32累加与softcap padding，保留原dispatch/tail边界 |
 | A02/A05/A09/A11 | 同包内各自保留来源、适配依赖与独立测试，不带入本包以外的候选 |
 
-先人工审阅这一个综合候选，不批量创建所有剩余候选 PR。包内保留可拆提交，维护者如要求再拆，不为扩大粒度加入新修复。公开差异保留必要源码、测试和来源，长调研与本机取证路径留在 fork；新分支推送和公开发布仍另行授权。
+先人工审阅这一个综合候选，不批量创建所有剩余候选 PR。包内保留可拆提交，维护者如要求再拆，不为扩大粒度加入未核对或未测项。公开差异保留必要源码、测试和来源，长调研与本机取证路径留在 fork；当前 fork 更新已获授权，创建 PR/合并仍另行授权。
 每项状态区分“开发已实现、独立验收、组合验收、PR准备/发布、上游合入”，不因本机通过或一次 squash 自动升级为已交付。
 PR 目标是 `tc-mb/llama.cpp-omni`，`ggml-org/llama.cpp` 是补丁来源。提交前重新检查目标 base、已有 PR、适用 CI 与贡献规范；人类提交者负责审阅、解释和如实披露 AI 辅助，发布仍另行授权。
 
 ### LES 与算子的所有权交接
 
-- R3 就是已完成的 A05，不再另做；R1/R2 分别对应未开展的 A01/B04。
+- R3 就是已完成的 A05，不再另做；R1=A01尚未开展，R2=B04已在算子分支完成累加/softcap正确性子项，尚未集成回LES检查点，非向量head优化仍未移植。
 - D02=O1/Metal O3 tile，D03=O2，D05包含 Metal O3 fusion，D01=O4：是同一候选的不同索引，不另计一次任务。E02/P3 与 LES T5.1 统一设计。
 - 真实 ID/slot、context-owned bank、scheduler、动态 repack 失效与预算归 LES 负责人；context-owned 迁移已经完成，不重做。B05 的临时 RHS scratch 不等于 LES 持久专家缓存，B06 寻址不等于 D02 紧凑 tile。
 - 公共测试文件由集成负责人串行收敛；组合失败先对照独立检查点和基线定位，再将修复交回对应源分支，不在两边分别实现。既有缺陷、回归、未验收组合分开记录，不以范围扩大掩盖失败。
