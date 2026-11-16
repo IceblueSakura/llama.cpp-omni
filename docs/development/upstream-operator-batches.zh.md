@@ -1,6 +1,6 @@
 # 上游算子修复分批执行记录
 
-最初记录：2026-11-15；工作区收敛：2026-11-16。工作目录：`/home/sakura/workspace/llm/llama.cpp-omni-operators`，分支：`fix/upstream-operators`。
+最初记录：2026-11-15；工作区收敛：2026-11-16。工作目录：`/home/sakura/workspace/llm/omni/llama.cpp-omni-operators`，分支：`fix/upstream-operators`。
 
 **下一步默认开发入口就是本 worktree / 分支。** 当前角色、归档恢复、CI/CD后置及下一任务见[第10节](#10-工作区收敛与下一步入口2026-11-16)；不从 LES、PR 或已撤下的旧集成 worktree 继续日常回移植。
 
@@ -53,7 +53,7 @@
 已识别设备：NVIDIA GeForce RTX 5060，8151 MiB，driver 615.78.08；backend 报告可见 VRAM 7796 MiB。已实现的 devShell 提供 CUDA 12.9.86，CUDA host compiler 为 GCC 14.4.0，普通 C/C++ 为 GCC 15.3.0；memcheck 使用本机已有 Compute Sanitizer 2026.3.0.0。未修改 flake 输入和 lock。
 
 ```bash
-cd /home/sakura/workspace/llm/llama.cpp-omni-operators
+cd /home/sakura/workspace/llm/omni/llama.cpp-omni-operators
 nix develop --no-update-lock-file .#cuda --command bash -c '
   set -e
   cmake -S . -B build-operators-cuda -G Ninja \
@@ -244,7 +244,7 @@ AMD 首次使用主机 Mesa 26.3 的 ICD 时，LLVM 要求 `GLIBC_2.44`，与项
 ### 环境与复验
 
 ```bash
-cd /home/sakura/workspace/llm/llama.cpp-omni-operators
+cd /home/sakura/workspace/llm/omni/llama.cpp-omni-operators
 nix develop --no-update-lock-file .#vulkan --command bash -c '
   set -e
   cmake -S . -B build-operators-vulkan -G Ninja \
@@ -280,7 +280,7 @@ AMD 使用兼容的 Mesa，而不是混入更新主机 glibc：
 
 ```bash
 MESA=$(nix build --impure --no-link --print-out-paths --expr \
-  'let f = builtins.getFlake "/home/sakura/workspace/llm/llama.cpp-omni-operators";
+  'let f = builtins.getFlake "/home/sakura/workspace/llm/omni/llama.cpp-omni-operators";
        p = import f.inputs.nixpkgs { system = "x86_64-linux"; };
    in p.mesa')
 export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
@@ -373,13 +373,13 @@ PR 目标是 `tc-mb/llama.cpp-omni`，`ggml-org/llama.cpp` 是补丁来源。提
 
 ## 10. 工作区收敛与下一步入口（2026-11-16）
 
-用户选择“算子主线，保留3个工作区”。本次只收敛本地目录与职责，没有合并LES/算子、修改CI配置、移动master或更新远端。
+用户选择“算子主线，保留3个工作区”，随后统一搬入 `llm/omni/`。[组织层说明](../../../AGENTS.md) 位于worktree父目录。本次只收敛本地目录与职责，没有合并LES/算子、修改CI配置、移动master或更新远端。
 
 | 角色 | Worktree | 分支 / 规则 |
 |---|---|---|
-| **唯一日常开发入口** | `/home/sakura/workspace/llm/llama.cpp-omni-operators` | **`fix/upstream-operators`**；新增上游核对、源码、测试、执行记录及分步提交在这里完成 |
-| PR审阅/发布快照 | `/home/sakura/workspace/llm/llama.cpp-omni-pr-operators` | `pr/ggml-operator-correctness`，目前 `c826b17` / [Draft #156](https://github.com/tc-mb/llama.cpp-omni/pull/156)；不直接作为日常开发分支，完成独立验收后再显式更新纯代码快照 |
-| LES冻结及公共Git目录 | `/home/sakura/workspace/llm/llama.cpp-omni` | `feat/les-backend-cache`；生产代码保持8122139阶段，只更新必要交接索引，不开展T2或混入算子 |
+| **唯一日常开发入口** | `/home/sakura/workspace/llm/omni/llama.cpp-omni-operators` | **`fix/upstream-operators`**；新增上游核对、源码、测试、执行记录及分步提交在这里完成 |
+| PR审阅/发布快照 | `/home/sakura/workspace/llm/omni/llama.cpp-omni-pr-operators` | `pr/ggml-operator-correctness`，目前 `c826b17` / [Draft #156](https://github.com/tc-mb/llama.cpp-omni/pull/156)；不直接作为日常开发分支，完成独立验收后再显式更新纯代码快照 |
+| LES冻结及公共Git目录 | `/home/sakura/workspace/llm/omni/llama.cpp-omni` | `feat/les-backend-cache`；生产代码保持8122139阶段，只更新必要交接索引，不开展T2或混入算子 |
 
 当前算子生产代码与 `c826b17` 相同，检查点 `b97676b`；精确后续tip用 `git log/status` 查，不在本文自引用文档提交SHA。当前9组完整、B04部分、43组未开展；53组仍是候选池，不隐含全部实施。
 
@@ -398,5 +398,5 @@ PR 目标是 `tc-mb/llama.cpp-omni`，`ggml-org/llama.cpp` 是补丁来源。提
 2. 每个新算子仍要有本地定向构建、独立预期、适用的红绿及检测；CI后置不是跳过算子验证，也不能把新的实现错误一概推给CI。
 3. **建议下一任务为B03的CPU/Vulkan norm子项**：先对照 `72a926917`、`80d2c0c2c` 等实际diff、依赖与旧实现，选择可验证的最小子集，覆盖非连续输入、batch和尾行；Metal GROUP_NORM仍待目标环境。此次收敛没有开始这项实现。
 4. 后续再按证据评估B08、B07的CUDA子项；HIP/ARM/Metal不以本机结果代验，性能组织与公共API仍不混入当前正确性组。
-5. `build-operators-*` 中有历史产物，首次使用前增量重建受影响target并重新绑定源码身份；不借其他worktree旧二进制作为新改动通过证据。最新已验收产物和原始红绿仍在保留的PR worktree `build-pr-vulkan/evidence/extension/`。
+5. 搬迁前的 `build-*` 含旧源码/构建绝对路径和可能的RPATH，保留为历史产物；下一任务须另建构建目录重新配置/构建受影响target，不能只沿用旧cache。PR worktree的 `build-pr-vulkan/evidence/extension/` 保留原始红绿及身份记录，搬迁后BLAKE3一致只证明完整性，不代表二进制能在新路径直接运行；旧日志原路径不改写。
 6. 以后需要组合LES时，从保留的集成分支恢复独立worktree，显式刷新输入并重跑有影响的组合检查；不要将两个源功能分支互相合并，也不把LES带入算子PR。
