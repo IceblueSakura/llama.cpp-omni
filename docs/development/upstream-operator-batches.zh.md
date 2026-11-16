@@ -341,7 +341,7 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 ### 本算子工作线的交付顺序
 
 1. **配合集成 I0–I4**：冻结 OP-L1/L2/L3；在待建 `integration/les-operators` worktree 从 LES 检查点起逐批 merge，每步先编译并验证对应算子和 LES CPU 回归，再验最终组合的 GPU 同步链与模型数值。原两个分支不互相合并，master 不动；每个实际 merge/提交另需授权。
-2. **准备当前综合发布包**：用户审阅 A04 后明确选择现有 OP-L1–L3 合成一个算子正确性 PR。保留已推送的 `pr/ggml-concat-quant` 供历史审阅，另建 `pr/ggml-operator-correctness`，不强制更新旧分支。
+2. **准备当前综合发布包**：用户选择现有 OP-L1–L3 合成一个算子正确性 PR。当前分支 `pr/ggml-operator-correctness` 的三个提交已按修改范围重写为英文全文后中文全文，列完整 upstream ID，末尾各保留一份 AI assistance 和 Signed-off-by，不在公开说明中携带本地批次序号。先行 CONCAT 本地/远端分支已按用户授权删除，旧目录 detached 保留取证；精确 refs 和验证映射见 integration 的 HANDOFF。
 3. **独立发布分支验收**：从已核对的 `tc-mb/llama.cpp-omni` master 提取三批纯源码/测试，保留三批提交及逐项来源；共13个文件，不带 LES、长调研文档、新能力或未测候选。该分支独立构建与复核 CPU/CUDA/Vulkan；具体结果在 integration 的 HANDOFF 第 6 节维护，不用组合通过代替。
 4. **再选下一修复批次**：组合 I3/I4 收口后，优先 B04 CPU FA、A08 Vulkan NVFP4 LUT、B03 CPU/Vulkan norm 子项；每项仍核对具体前置/后续修复，不引入 core API、融合或整 backend 重排。其余第 8 节候选保持原相对优先级。
 5. **Metal 独立排期**：在确认机器、构建目录和资源后做 M1；LES G1-M 原始 oracle 与 M1 是两类验收，双方原通过项不能互代。D/E 类继续后置，C类先证明真实图可达。
