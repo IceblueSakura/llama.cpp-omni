@@ -1,6 +1,6 @@
 # 上游算子修复分批执行记录
 
-最初记录：2026-11-15；工作区收敛：2026-11-16；最近进展：2026-11-17（B03 CPU/Vulkan、B08、B07 CUDA同步）。工作目录：`/home/sakura/workspace/llm/omni/llama.cpp-omni-operators`，分支：`fix/upstream-operators`。
+最初记录：2026-11-15；工作区收敛：2026-11-16；最近进展：2026-11-17（B04闭合、A10 CPU alias完成）。工作目录：`/home/sakura/workspace/llm/omni/llama.cpp-omni-operators`，分支：`fix/upstream-operators`。
 
 **下一步默认开发入口就是本 worktree / 分支。** 当前角色、归档恢复、CI/CD后置及下一任务见[第10节](#10-工作区收敛与下一步入口2026-11-16)；不从 LES、PR 或已撤下的旧集成 worktree 继续日常回移植。
 
@@ -300,7 +300,7 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 
 ## 8. 当前整体进度与剩余候选
 
-统计单位为主调研的稳定候选ID，不是commit数、后端数或工时。截至2026-11-17，53组中 **11组完整移植、B03/B07部分移植、40组尚未开展**。B04的F32累加、softcap/padding及x86非向量head tiled/SIMD tail已全部移植并定向验收，候选闭合；B03 Metal、B07 HIP子项继续硬件待办。PR快照未更新。“完整移植”不等于所有平台/模型/性能均验收，尤其保留B05 shared-memory动态检测缺口和A11本机未复现旧故障的说明。
+统计单位为主调研的稳定候选ID，不是commit数、后端数或工时。截至2026-11-17，53组中 **12组完整移植、B03/B07部分移植、39组尚未开展**。B04的F32累加、softcap/padding及x86非向量head tiled/SIMD tail已全部移植并定向验收；随后A10两个CPU反向算子的alias修复以同一模块完成红绿。B03 Metal、B07 HIP子项继续硬件待办，PR快照未更新。“完整移植”不等于所有平台/模型/性能均验收，尤其保留B05 shared-memory动态检测缺口和A11本机未复现旧故障的说明。
 
 | 批次 | 候选 ID | 提交 |
 |---|---|---|
@@ -312,12 +312,13 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 | B08 CUDA | Q8_1普通量化/MMQ correction sum | [逐提交验收](operator-acceptance/2026-11-17-b08-q8-correction.md)，含原始来源与提交查询 |
 | B07 CUDA同步 | MMF/MMID warp共享内存同步，HIP项暂跳过 | [逐提交验收](operator-acceptance/2026-11-17-b07-mmf-mmid-sync.md)，含racecheck/synccheck红绿及提交查询 |
 | B04收口 | x86非向量head tiled/SIMD tail，补齐既有正确性切片 | [逐提交验收](operator-acceptance/2026-11-17-b04-x86-tiled-tail.md)，含两ISA路径、边界检测与五次定向perf |
+| A10 CPU | RMS_NORM_BACK/SOFT_MAX_BACK exact-src alias | [逐提交验收](operator-acceptance/2026-11-17-a10-backward-alias.md)，含gallocr地址断言、独立梯度预期及红绿 |
 
 ### 尚未完整移植的清单（完整 ID）
 
 | 分类 | 已移植 / 总数 | 尚未完整移植 |
 |---|---|---|
-| A：单后端局部修补 | 6 / 12 | A01 ARM tile；A03 Metal CPY；A06 TRI；A07 SOLVE_TRI；A10 CPU 反向算子 alias；A12 Metal 64-bit offset |
+| A：单后端局部修补 | 7 / 12 | A01 ARM tile；A03 Metal CPY；A06 TRI；A07 SOLVE_TRI；A12 Metal 64-bit offset |
 | B：配套正确性/helper | 5 / 13，另2组部分完成 | B02 transpose-conv；B03剩余Metal GROUP_NORM；B07剩余HIP wave64/BF16 WMMA；B09 Metal FA；B10 CUDA FA/norm/softmax 同步；B11 大 grid；B12 view/GLU；B13 CPU ISA/helper |
 | C：backend/类型能力补齐 | 0 / 10 | C01–C10：池化、reflect pad、Metal PAD、SET_ROWS/BF16、卷积/IM2COL、GDN/GLA、OpenCL/WebGPU、量化快路及训练算子 |
 | D：性能组织变化 | 0 / 10 | D01–D10：CPU tiled、紧凑专家 tile、MMQ/少行 matmul、routing/reduce/top-k/FA 融合、ARM repack、移动端及布局/归约优化 |
@@ -332,8 +333,8 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 | 顺序/难度 | 模块 | 范围与进入条件 |
 |---|---|---|
 | 0：先闭合 | B04 CPU FA | 本机AVX2/AVX512剩余切片已收口；B03 Metal、B07 HIP是硬件待办，不用本机代验 |
-| 1：简单CPU局部 | **A10，当前唯一下一模块** | RMS_NORM_BACK/SOFT_MAX_BACK同一alias合同；两个既有局部修复，无新API、模型或GPU依赖。旧推理优先级较低，此次按闭合成本优先 |
-| 2：其余CPU小切片 | B02 CPU，再评估B13可达helper及B12局部view | 每次只选一个同类合同；B02 Metal及ARM/特殊ISA另行待办，不整组打包 |
+| 1：简单CPU局部 | A10已完成 | RMS_NORM_BACK/SOFT_MAX_BACK同一alias合同，实际16/24→24/24；本轮在B04提交后单独完成，未并行扩展其他模块 |
+| 2：其余CPU小切片 | **B02 CPU，当前唯一下一步核对项**；其后再评估B13可达helper及B12局部view | 先核对transpose-conv多batch/stride/scratch和独立预期，再决定最小CPU切片；本轮未实施。B02 Metal及ARM/特殊ISA另行待办，不整组打包 |
 | 3：GPU局部正确性 | B11可小规模复现的dispatch、B12 Vulkan GLU/stride | 先核对实际diff、设备上限和可命中case；若需大内存或核心API变化则暂缓，不为适配扩大范围 |
 | 4：复杂GPU同步 | B10 CUDA FA/norm/softmax | 排在简单模块之后，逐kernel切片，必须racecheck/synccheck；不同时展开多个算子族 |
 | 5：后端能力 | C01/C02音频可达项，再选择其他C类 | 先证明模型图可达，分别验kernel、placement和fallback；不因新增kernel就宣称模型收益 |
@@ -345,17 +346,17 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 
 ## 9. 当前确定的集成、发布与下一批方向
 
-原集成冻结输入仍为 LES `81221392bc89eaf0836898d463123e123b3171aa` 与算子 `b17420c347612951dd3832794e1212dec515bbf4`，共同基点 `350a835d5f8215145aa210a7df0f67e8877b5d6e`。算子检查点 `b97676b` 源码/测试与审阅候选 `c826b17` 相同；第11节 B03 是其后的本地提交增量，未同步 PR。这些新增改动未自动带入 LES 或原集成源码，不借旧模型结果外推。
+原集成冻结输入仍为 LES `81221392bc89eaf0836898d463123e123b3171aa` 与算子 `b17420c347612951dd3832794e1212dec515bbf4`，共同基点 `350a835d5f8215145aa210a7df0f67e8877b5d6e`。算子检查点`b97676b`源码/测试与审阅候选`c826b17`相同；其后B03/B08/B07/B04/A10本地增量均未同步PR，也未自动带入LES或原集成源码，不借旧模型结果外推。
 历史 I0–I5 计划在 LES `docs/les/HANDOFF.md`，执行记录保存在 `integration/les-operators` 分支同名文件，可用 `git show integration/les-operators:docs/les/HANDOFF.md` 读取。该旧 worktree 已归档撤下，不再作为当前写入入口。收敛后，**算子当前进度/下一步以本文件为主记录**；历史组合流水不复制、不追记为当前运行时通过。
 
-组合 I0–I4、先行候选及后续扩充的精确范围、输入与结果见上述集成记录。本算子源分支没有合入LES生产代码，纯代码候选记录为 [Draft PR #156](https://github.com/tc-mb/llama.cpp-omni/pull/156)，未Ready/合入；本轮未联网刷新其状态。剩余40组未开展和B03/B07部分项不是本PR必须全部完成的清单。
+组合 I0–I4、先行候选及后续扩充的精确范围、输入与结果见上述集成记录。本算子源分支没有合入LES生产代码，纯代码候选记录为 [Draft PR #156](https://github.com/tc-mb/llama.cpp-omni/pull/156)，未Ready/合入；本轮未联网刷新其状态。剩余39组未开展和B03/B07部分项不是本PR必须全部完成的清单。
 
 ### 本算子工作线的交付顺序
 
 1. **配合集成 I0–I4**：冻结 OP-L1/L2/L3；在待建 `integration/les-operators` worktree 从 LES 检查点起逐批 merge，每步先编译并验证对应算子和 LES CPU 回归，再验最终组合的 GPU 同步链与模型数值。原两个分支不互相合并，master 不动；每个实际 merge/提交另需授权。
 2. **当前综合发布包**：用户允许继续修正并追加已验证上游算子修复。`pr/ggml-operator-correctness@c826b17` 当前5个提交，英文全文后中文全文，完整 upstream ID，末尾各一份 AI assistance 和 Signed-off-by，不携带本地批次序号；先行 CONCAT 分支和worktree已移除，9954c4a及其构建/取证由本地bundle和归档保留。
 3. **独立发布分支验收**：当前16个源码/测试文件、672行新增/142行删除，不含 LES、长调研文档、新能力或未验收的性能重排。修复前后数值及 Vulkan 同步红绿证据已独立完成；Metal仅源级保护，尚未宣称 Mac 编译/运行通过。详情在 integration HANDOFF 第6节维护。
-4. **再选下一修复批次**：B04已补齐收口；下一模块仅A10 CPU alias，然后按第8节从简单到困难串行推进。每项核对前置/后续依赖，仍不引入core API、融合或整backend重排。
+4. **再选下一修复批次**：B04已补齐收口、A10随后完成；下一步仅核对B02 CPU transpose-conv，再按第8节从简单到困难串行推进。每项核对前置/后续依赖，仍不引入core API、融合或整backend重排。
 5. **暂跳过无验收条件的子项**：按2026-11-17用户选择，macOS/Metal/MoltenVK暂不推进；其他缺少目标硬件的子项同样不代验。LES G1-M原始oracle与M1是不同验收，D/E类继续后置，C类先证明真实图可达。
 
 开发继续按同类小批共享 Nix 构建，**当前按用户选择交付一组已核对、独立验证的算子正确性修改，可在相同边界下追加**。以下是包内审阅分项，不表示必须分别打开 PR：
@@ -390,7 +391,7 @@ PR 目标是 `tc-mb/llama.cpp-omni`，`ggml-org/llama.cpp` 是补丁来源。提
 | PR审阅/发布快照 | `/home/sakura/workspace/llm/omni/llama.cpp-omni-pr-operators` | `pr/ggml-operator-correctness`，目前 `c826b17` / [Draft #156](https://github.com/tc-mb/llama.cpp-omni/pull/156)；不直接作为日常开发分支，完成独立验收后再显式更新纯代码快照 |
 | LES冻结及公共Git目录 | `/home/sakura/workspace/llm/omni/llama.cpp-omni` | `feat/les-backend-cache`；生产代码保持8122139阶段，只更新必要交接索引，不开展T2或混入算子 |
 
-算子检查点`b97676b`与PR快照`c826b17`相同；另有B03/B08/B07/B04本地提交增量，PR快照未更新。精确后续tip及本地修改用`git log/status/diff`查。当前11组完整、B03/B07部分、40组未开展；每个新提交随附[独立验收文档](operator-acceptance/README.md)，不强制公开PR提交格式。按第8节单模块串行，不隐含实施全部53组。
+算子检查点`b97676b`与PR快照`c826b17`相同；另有B03/B08/B07/B04/A10本地提交增量，PR快照未更新。精确后续tip及本地修改用`git log/status/diff`查。当前12组完整、B03/B07部分、39组未开展；每个新提交随附[独立验收文档](operator-acceptance/README.md)，不强制公开PR提交格式。按第8节单模块串行，不隐含实施全部53组。
 
 ### 已撤下的两个 worktree
 
@@ -405,7 +406,7 @@ PR 目标是 `tc-mb/llama.cpp-omni`，`ggml-org/llama.cpp` 是补丁来源。提
 
 1. **CI/CD修复后置为独立阶段**，在选定算子回移阶段收尾后再切换；本次不改workflow、不关闭或重跑远端CI、不把已知基线CI问题当作本地回移阻塞。以后正常更新PR可能自动触发CI，不代表已切到CI修复阶段。已观察的 `is_host_addressable` 初始化和旧 `llama-server` target问题保留待后续归因处理，不在本轮顺带修复。
 2. 每个新算子仍要有本地定向构建、独立预期、适用的红绿及检测；CI后置不是跳过算子验证，也不能把新的实现错误一概推给CI。
-3. **B04本机剩余项已收口**；B03 Metal、B07 HIP继续硬件待办。下一模块只推进A10 CPU反向alias，随后按第8节从简单到困难串行；不并行扩展其他模块，完成文档/验收/提交后再选下一项。PR未同步，不自动扩大到能力/性能/API迁移。
+3. **B04本机剩余项已收口，A10 CPU反向alias已随后完成**；B03 Metal、B07 HIP继续硬件待办。下一步只核对B02 CPU transpose-conv，按第8节从简单到困难串行；不并行扩展其他模块，完成文档/验收/提交后再选下一项。PR未同步，不自动扩大到能力/性能/API迁移。
 4. B07真实wave64/BF16 HIP项暂跳过；HIP/ARM/Metal不以本机结果代验，性能组织与公共API仍不混入当前正确性组。
 5. 搬迁前的 `build-*` 含旧源码/构建绝对路径和可能的RPATH，保留为历史产物，不能沿用旧cache。B03/B08已在迁移后新建目录配置并执行；相同工作区/配置的后续批次可定向增量构建，逐批记录源码/产物身份和raw logs。PR worktree的 `build-pr-vulkan/evidence/extension/` 保留原始红绿及身份记录，搬迁后BLAKE3一致只证明完整性，不代表二进制能在新路径直接运行；旧日志原路径不改写。
 6. 以后需要组合LES时，从保留的集成分支恢复独立worktree，显式刷新输入并重跑有影响的组合检查；不要将两个源功能分支互相合并，也不把LES带入算子PR。
