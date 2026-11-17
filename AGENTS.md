@@ -2,6 +2,10 @@
 
 This file defines the current policy for llama.cpp-omni. The inherited llama.cpp policy is archived in [AGENTS.llama.cpp.md](AGENTS.llama.cpp.md).
 
+## Local operator maintenance worktree
+
+For `llama.cpp-omni-operators` / `fix/upstream-operators`, the user's 2026-11-17 local workflow takes precedence over public-PR commit formatting: fine-grained local commits are authorized, each with a separate acceptance document under [docs/development/operator-acceptance/](docs/development/operator-acceptance/README.md). Record full original upstream commit IDs, adaptations, verification and limitations there. Skip macOS/Metal/MoltenVK and other sub-items without target validation conditions for now. Do not automatically update the PR worktree or remotes; public contribution policy still applies when preparing publication.
+
 > [!IMPORTANT]
 > This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
 >

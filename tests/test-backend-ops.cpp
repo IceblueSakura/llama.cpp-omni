@@ -3309,24 +3309,32 @@ struct test_norm : public test_case {
     const std::array<int64_t, 4> ne;
     const bool v; // whether a is a non-contiguous view
     const float eps;
+    const bool noncontig_rows;
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, v, eps);
+        return VARS_TO_STR5(type, ne, v, eps, noncontig_rows);
     }
 
     test_norm(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {64, 5, 4, 3},
             bool v = false,
-            float eps = 1e-6f)
-        : type(type), ne(ne), v(v), eps(eps) {}
+            float eps = 1e-6f,
+            bool noncontig_rows = false)
+        : type(type), ne(ne), v(v), eps(eps), noncontig_rows(noncontig_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        const std::array<int64_t, 4> ne_a = noncontig_rows ?
+            std::array<int64_t, 4>{ ne[1], ne[0], ne[2], ne[3] } : ne;
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_set_name(a, "a");
 
         if (v) {
             a = ggml_view_4d(ctx, a, a->ne[0]/2, a->ne[1]/2, a->ne[2]/2, a->ne[3]/2, a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view of a");
+        }
+        if (noncontig_rows) {
+            a = ggml_permute(ctx, a, 1, 0, 2, 3);
+            ggml_set_name(a, "permuted a");
         }
 
         ggml_tensor * out = ggml_norm(ctx, a, eps);
@@ -6368,30 +6376,129 @@ struct test_l2_norm : public test_case {
     const std::array<int64_t, 4> ne;
     const float eps;
     bool v;
+    const bool noncontig_rows;
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, eps, v);
+        return VARS_TO_STR5(type, ne, eps, v, noncontig_rows);
     }
 
     test_l2_norm(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {64, 64, 320, 1},
             float eps = 1e-12f,
-            bool v = false)
-        : type(type), ne(ne), eps(eps), v(v) {}
+            bool v = false,
+            bool noncontig_rows = false)
+        : type(type), ne(ne), eps(eps), v(v), noncontig_rows(noncontig_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        const std::array<int64_t, 4> ne_a = noncontig_rows ?
+            std::array<int64_t, 4>{ ne[1], ne[0], ne[2], ne[3] } : ne;
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_set_name(a, "a");
 
         if (v) {
             a = ggml_view_4d(ctx, a, a->ne[0]/2, a->ne[1]/2, a->ne[2]/2, a->ne[3]/2, a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view of a");
         }
+        if (noncontig_rows) {
+            a = ggml_permute(ctx, a, 1, 0, 2, 3);
+            ggml_set_name(a, "permuted a");
+        }
 
         ggml_tensor * out = ggml_l2_norm(ctx, a, eps);
         ggml_set_name(out, "out");
 
         return out;
+    }
+};
+
+// Independent row-normalization oracle, including strided inplace output and view offsets.
+struct test_row_norm : public test_case {
+    const ggml_op op;
+    const std::array<int64_t, 4> ne;
+    const bool strided;
+    const bool inplace;
+    const float eps;
+    const bool offset;
+    std::vector<float> expected;
+
+    test_row_norm(ggml_op op, std::array<int64_t, 4> ne, bool strided, bool inplace, float eps = 1e-4f, bool offset = false)
+        : op(op), ne(ne), strided(strided), inplace(inplace), eps(eps), offset(offset) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(ne, strided, inplace, eps, offset, op);
+    }
+
+    std::string op_desc(ggml_tensor *) override {
+        return std::string(ggml_op_name(op)) + "_ORACLE";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        if (strided) {
+            a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[1] + 2, ne[0] + 1, ne[2] + 1, ne[3] + 1);
+            ggml_set_name(a, "norm_backing");
+            a = ggml_view_4d(ctx, a, ne[1], ne[0], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], sizeof(float));
+            a = ggml_permute(ctx, a, 1, 0, 2, 3);
+        } else if (offset) {
+            a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] + 2, ne[1] + 1, ne[2] + 1, ne[3] + 1);
+            ggml_set_name(a, "norm_backing");
+            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], sizeof(float));
+        } else {
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_name(a, "norm_backing");
+        }
+        ggml_tensor * out = op == GGML_OP_NORM ?
+            (inplace ? ggml_norm_inplace(ctx, a, eps) : ggml_norm(ctx, a, eps)) :
+            (inplace ? ggml_l2_norm_inplace(ctx, a, eps) : ggml_l2_norm(ctx, a, eps));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        ggml_tensor * backing = ggml_get_tensor(ctx, "norm_backing");
+        std::vector<float> data(ggml_nelements(backing));
+        for (size_t i = 0; i < data.size(); ++i) {
+            data[i] = float(int(i % 29) - 14) / 8.0f;
+        }
+        ggml_backend_tensor_set(backing, data.data(), 0, ggml_nbytes(backing));
+        const auto input = tensor_to_float(ggml_get_tensor(ctx, "out")->src[0]);
+        expected.resize(input.size());
+        for (size_t row = 0; row < input.size(); row += ne[0]) {
+            double mean = 0.0;
+            if (op == GGML_OP_NORM) {
+                for (int64_t col = 0; col < ne[0]; ++col) {
+                    mean += input[row + col];
+                }
+                mean /= ne[0];
+            }
+            double sum = 0.0;
+            for (int64_t col = 0; col < ne[0]; ++col) {
+                const double x = input[row + col] - mean;
+                sum += x * x;
+            }
+            const double divisor = op == GGML_OP_NORM ? sqrt(sum / ne[0] + eps) : std::max(sqrt(sum), double(eps));
+            for (int64_t col = 0; col < ne[0]; ++col) {
+                expected[row + col] = float((input[row + col] - mean) / divisor);
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        // View nodes are skipped by the harness; retain its sentinel checks.
+        if (n != expected.size()) {
+            GGML_ASSERT(n == sentinel_size);
+            return std::equal(a, a + n, b) ? 0.0 : 1.0;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const float tolerance = 2e-5f * (1.0f + fabsf(expected[i]));
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i]) ||
+                fabsf(a[i] - expected[i]) > tolerance || fabsf(b[i] - expected[i]) > tolerance) {
+                printf("row norm oracle mismatch at %zu: expected=%g actual=(%g,%g) ", i, expected[i], a[i], b[i]);
+                return 1.0;
+            }
+        }
+        return 0.0;
     }
 };
 
@@ -8552,9 +8659,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
                 test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
             }
+            test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, false, eps, true));
             test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, eps));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+            test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false, true));
+        }
+    }
+
+    for (ggml_op op : { GGML_OP_NORM, GGML_OP_L2_NORM }) {
+        for (bool inplace : { false, true }) {
+            test_cases.emplace_back(new test_row_norm(op, {7, 5, 2, 3}, true, inplace));
+            test_cases.emplace_back(new test_row_norm(op, {7, 5, 2, 3}, false, inplace, 1e-4f, true));
+        }
+        test_cases.emplace_back(new test_row_norm(op, {7, 5, 2, 3}, false, false, 10.0f));
+        for (int64_t rows : {511, 512, 513, 262143, 262144, 262145}) {
+            test_cases.emplace_back(new test_row_norm(op, {7, rows, 1, 1}, false, false));
         }
     }
 
