@@ -300,7 +300,7 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 
 ## 8. 当前整体进度与剩余候选
 
-统计单位为主调研的稳定候选ID，不是commit数、后端数或工时。截至2026-11-18，53组中 **12组完整移植、B02/B03/B07/B11/B12/B13部分移植、35组尚未开展**。B04、A10已闭合；B02 CPU、B13 x86 quick GELU、B12 CPU F32 SUM和B11 CUDA PAD均完成独立红绿。已审阅的 Draft PR #156 仍在 `b669a4a`（含 A10/B02 CPU），未包含 B11/B12。“完整移植”不等于所有平台/模型/性能均验收，尤其保留B05 shared-memory动态检测缺口和A11本机未复现旧故障的说明。
+统计单位为主调研的稳定候选ID，不是commit数、后端数或工时。截至2026-11-18，53组中 **12组完整移植、B02/B03/B07/B11/B12/B13部分移植、35组尚未开展**。B04、A10已闭合；B02 CPU、B13 x86 quick GELU、B12 CPU F32 SUM 完成独立红绿；B11 可在本机验收的 CUDA/Vulkan 范围已按组交付，HIP 待目标环境。已审阅的 Draft PR #156 仍在 `b669a4a`（含 A10/B02 CPU），未包含 B11/B12。“完整移植”不等于所有平台/模型/性能均验收，尤其保留B05 shared-memory动态检测缺口和A11本机未复现旧故障的说明。
 
 | 批次 | 候选 ID | 提交 |
 |---|---|---|
@@ -316,30 +316,30 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 | B02 CPU | CONV_TRANSPOSE_2D多batch、nb13和scratch，Metal待办 | [逐提交验收](operator-acceptance/2026-11-17-b02-cpu-transpose-conv.md)，含独立scatter-add与精确work buffer探针 |
 | B13 x86 quick GELU | F32 GELU_QUICK/GEGLU_QUICK不经F16表；其他helper待办 | [逐提交验收](operator-acceptance/2026-11-17-b13-x86-quick-gelu.md)，含SSE2/AVX2/AVX512、数学oracle与lookup兼容分流 |
 | B12 CPU F32 SUM | 非连续 dim 0；其他后端与 SCALE/unary/GLU 待办 | [逐提交验收](operator-acceptance/2026-11-18-b12-cpu-sum-strides.md)，含独立 oracle 和 offset/空洞探针 |
-| B11 CUDA PAD | 输出行及切片跨过 y/z grid 上限 | [逐提交验收](operator-acceptance/2026-11-18-b11-cuda-pad-grid.md)，含 RTX 5060 启动红绿及 memcheck |
+| B11 大 grid / dispatch | CUDA PAD/norm、Vulkan RMS_NORM（含融合）及 GROUP_NORM；HIP reflect 待目标环境 | [组验收](operator-acceptance/2026-11-18-b11-dispatch.md)，含 CUDA 动态检测、NVIDIA Vulkan 与 llvmpipe 红绿 |
 
 ### 尚未完整移植的清单（完整 ID）
 
 | 分类 | 已移植 / 总数 | 尚未完整移植 |
 |---|---|---|
 | A：单后端局部修补 | 7 / 12 | A01 ARM tile；A03 Metal CPY；A06 TRI；A07 SOLVE_TRI；A12 Metal 64-bit offset |
-| B：配套正确性/helper | 5 / 13，另6组部分完成 | B02剩余Metal transpose-conv；B03剩余Metal GROUP_NORM；B07剩余HIP wave64/BF16 WMMA；B09 Metal FA；B10 CUDA FA/norm/softmax 同步；B11 剩余 HIP reflect、CUDA norm/RoPE、Vulkan norm；B12 剩余 SUM 后端门控、SCALE/unary/GLU；B13剩余SVE/NEON/AVX512-FP16等helper |
+| B：配套正确性/helper | 5 / 13，另6组部分完成 | B02剩余Metal transpose-conv；B03剩余Metal GROUP_NORM；B07剩余HIP wave64/BF16 WMMA；B09 Metal FA；B10 CUDA FA/norm/softmax 同步；B11 仅 HIP reflect 待目标环境；B12 剩余 SUM 后端门控、SCALE/unary/GLU；B13剩余SVE/NEON/AVX512-FP16等helper |
 | C：backend/类型能力补齐 | 0 / 10 | C01–C10：池化、reflect pad、Metal PAD、SET_ROWS/BF16、卷积/IM2COL、GDN/GLA、OpenCL/WebGPU、量化快路及训练算子 |
 | D：性能组织变化 | 0 / 10 | D01–D10：CPU tiled、紧凑专家 tile、MMQ/少行 matmul、routing/reduce/top-k/FA 融合、ARM repack、移动端及布局/归约优化 |
 | E：公共合同/新能力 | 0 / 8 | E01–E08：precision、跳过 expert ID、RoPE、SSM/GDN 状态、稀疏 FA、新 opcode、模型索引及新格式 |
 
 多后端/多子项候选按实际完成范围记录；B02仅CPU完成，Metal不能代验；B04是在另补x86 tiled/tail切片后才闭合。C–E是候选池，不是必须全做的既定移植队列；性能组织和公共合同的成本不能按当前小修复线性估算。
 
-### 后续队列：先闭合，再从简单模块串行推进
+### 后续队列：按候选组串行推进
 
-2026-11-17用户选择：先闭合本机可完成的既有任务，再按依赖、合同影响和验收成本从简单到困难推进；不再广撒网。**同时只有一个实现中的模块**，依赖核对→最小实现→定向验收→独立文档/提交完成后，才进入下一模块。按[逐提交验收约定](operator-acceptance/README.md)维护，公开PR由用户另行组织。
+2026-11-18 用户改为按主调研候选组推进，同时只推进一组。组内优先处理依赖少、易复用回归的项目，但不在每个小切片后停下来单独交付。组内有条件的子项统一验收并交付；缺目标硬件或有未解决契约问题的，明确列阻塞与后续条件，不计作已完成。保持既有提交，按[验收约定](operator-acceptance/README.md)维护，公开 PR 由用户另行组织。下面是复杂度档位，不是逐切片交付顺序。
 
 | 顺序/难度 | 模块 | 范围与进入条件 |
 |---|---|---|
 | 0：先闭合 | B04 CPU FA | 本机AVX2/AVX512剩余切片已收口；B03 Metal、B07 HIP是硬件待办，不用本机代验 |
 | 1：简单CPU局部 | A10已完成 | RMS_NORM_BACK/SOFT_MAX_BACK同一alias合同，实际16/24→24/24；本轮在B04提交后单独完成，未并行扩展其他模块 |
-| 2：其余CPU小切片 | B02 CPU、B13 x86 quick GELU、B12 CPU F32 SUM 已完成 | B12 未改公共合同；SCALE 涉及核心构图断言，暂缓。Metal及特殊ISA继续待办 |
-| 3：GPU局部正确性 | B11 CUDA PAD 的 y/z grid 已完成；其余小切片单独核对，B12 Vulkan GLU/stride 暂缓 | B11 CUDA PAD 31/31、三条跨界 memcheck 无错误。后续仍先核对设备阈值和小规模复现；若需大内存或核心API变化则暂缓 |
+| 2：其余CPU小切片 | B02 CPU、B13 x86 quick GELU、B12 CPU F32 SUM 已完成 | Metal及特殊ISA继续待办 |
+| 3：GPU局部正确性 | B11 可验部分已统一交付；下一组 B12 | B11 HIP reflect 待目标环境，不以 NVIDIA 代验；CUDA 上游 RMS+RoPE 融合不在本地。B12 按组核对 SUM 能力门控、unary/GLU 和 SCALE；先确认受影响后端与构图合同，再决定可验范围 |
 | 4：复杂GPU同步 | B10 CUDA FA/norm/softmax | 排在简单模块之后，逐kernel切片，必须racecheck/synccheck；不同时展开多个算子族 |
 | 5：后端能力 | C01/C02音频可达项，再选择其他C类 | 先证明模型图可达，分别验kernel、placement和fallback；不因新增kernel就宣称模型收益 |
 | 6：性能/公共合同 | D类、E类 | D须热点及固定预算下收益证据；E须明确模型需求与独立迁移设计，不自动进入实施 |

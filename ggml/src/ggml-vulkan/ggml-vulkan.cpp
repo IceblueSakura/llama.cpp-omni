@@ -10664,7 +10664,8 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             // Run one element per thread, 128 threads per workgroup
             elements = { (uint32_t)CEIL_DIV(ne00, 128), 1, 1 };
         } else {
-            elements = { (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne03 };
+            const auto & limits = ctx->device->properties.limits.maxComputeWorkGroupCount;
+            elements = { (uint32_t)ne01, std::min((uint32_t)ne02, limits[1]), std::min((uint32_t)ne03, limits[2]) };
         }
         break;
 
@@ -10674,8 +10675,13 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     case GGML_OP_GROUP_NORM:
         {
-            const uint32_t num_groups = dst->op_params[0];
-            elements = { num_groups * (uint32_t)src0->ne[3], 1, 1 };
+            const uint32_t total_workgroups = dst->op_params[0] * (uint32_t)src0->ne[3];
+            const auto & limits = ctx->device->properties.limits.maxComputeWorkGroupCount;
+            const uint32_t groups_x = std::min(total_workgroups, limits[0]);
+            const uint32_t groups_y = std::min<uint64_t>(CEIL_DIV(uint64_t(total_workgroups), groups_x), limits[1]);
+            const uint64_t groups_xy = uint64_t(groups_x) * groups_y;
+            elements = { groups_x, groups_y, uint32_t(CEIL_DIV(uint64_t(total_workgroups), groups_xy)) };
+            GGML_ASSERT(elements[2] <= limits[2]);
         } break;
     case GGML_OP_DIAG_MASK_INF:
         elements = { (uint32_t)ggml_nrows(src0), (uint32_t)ne00, 1 };
@@ -11659,8 +11665,9 @@ static void ggml_vk_group_norm(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t num_groups = int_op_params[0];
     const float eps = float_op_params[1];
     const uint32_t group_size = src0->ne[0] * src0->ne[1] * ((src0->ne[2] + num_groups - 1) / num_groups);
+    const uint32_t num_workgroups = num_groups * src0->ne[3];
 
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_GROUP_NORM, { group_size, 0, eps, 0.0f, 0.0f, 0.0f });
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_GROUP_NORM, { group_size, num_workgroups, eps, 0.0f, 0.0f, 0.0f });
 }
 
 static uint32_t ggml_vk_rms_num_partials(ggml_backend_vk_context * ctx, const ggml_tensor *node) {
@@ -11818,8 +11825,12 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
         pc.rope.d_offset = get_misalign_bytes(ctx, tensors[5]) / ggml_type_size(tensors[5]->type);
         offset[5] &= ~(size_t(ctx->device->properties.limits.minStorageBufferOffsetAlignment) - 1);
 
-        std::array<uint32_t, 3> elements;
-        elements = { (uint32_t)rms->src[0]->ne[1], (uint32_t)rms->src[0]->ne[2], (uint32_t)rms->src[0]->ne[3] };
+        const auto & limits = ctx->device->properties.limits.maxComputeWorkGroupCount;
+        const std::array<uint32_t, 3> elements = {
+            (uint32_t)src0->ne[1],
+            std::min((uint32_t)src0->ne[2], limits[1]),
+            std::min((uint32_t)src0->ne[3], limits[2]),
+        };
 
         static_assert(max_tensors == 7);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,

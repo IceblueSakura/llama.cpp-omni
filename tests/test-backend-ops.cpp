@@ -2544,9 +2544,9 @@ struct test_rms_norm_mul_rope : public test_case {
         : ne(ne), eps(eps), multi_add(multi_add), set_rows(set_rows), mode(mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], 1);
-        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], 1);
-        ggml_tensor * c = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], 1);
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * c = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
 
         if (multi_add) {
             a = ggml_add(ctx, ggml_add(ctx, a, b), c);
@@ -2585,7 +2585,16 @@ struct test_rms_norm_mul_rope : public test_case {
                     continue;
                 }
 
-                init_set_rows_row_ids(t, ne[2]);
+                if (t->type == GGML_TYPE_I32 && ne[2] > 65535) {
+                    // Keep angles small so this tests dispatch, not large-angle trig.
+                    std::vector<int32_t> pos(ne[2]);
+                    for (size_t i = 0; i < pos.size(); ++i) {
+                        pos[i] = i % 64;
+                    }
+                    ggml_backend_tensor_set(t, pos.data(), 0, ggml_nbytes(t));
+                } else {
+                    init_set_rows_row_ids(t, ne[2]);
+                }
             } else {
                 init_tensor_uniform(t);
             }
@@ -8808,6 +8817,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
+    // Narrow tensors crossing the y/z dispatch boundary, not a memory stress test.
+    for (const std::array<int64_t, 4> ne : { std::array<int64_t, 4>{4, 1, 65536, 1}, {4, 1, 1, 65536} }) {
+        test_cases.emplace_back(new test_norm(GGML_TYPE_F32, ne));
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, ne));
+        test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, ne));
+        test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, ne, 1e-6f, false, false));
+        test_cases.emplace_back(new test_rms_norm_mul_rope(ne));
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_rope({4, 1, 65536, 1}, 1e-6f, false, true, GGML_ROPE_TYPE_NEOX));
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f }) {
         for (uint32_t n : { 64, 1025 }) {
@@ -9478,6 +9496,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 33, 256, 1, 1 }));
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {64, 64, 320, 1}));
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {9, 9, 1280, 1}));
+    test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {3, 1, 1, 65537}, 1));
     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {64, 64, 320, 1}));
     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {9, 9, 1280, 1}));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
