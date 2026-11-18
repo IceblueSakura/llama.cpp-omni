@@ -300,7 +300,7 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 
 ## 8. 当前整体进度与剩余候选
 
-统计单位为主调研的稳定候选ID，不是commit数、后端数或工时。截至2026-11-18，53组中 **12组完整移植、B02/B03/B07/B12/B13部分移植、36组尚未开展**。B04、A10已闭合；B02 CPU、B13 x86 quick GELU和B12 CPU F32 SUM均完成独立红绿。已审阅的 Draft PR #156 更新到 `b669a4a`（含 A10/B02 CPU），未包含 B12。“完整移植”不等于所有平台/模型/性能均验收，尤其保留B05 shared-memory动态检测缺口和A11本机未复现旧故障的说明。
+统计单位为主调研的稳定候选ID，不是commit数、后端数或工时。截至2026-11-18，53组中 **12组完整移植、B02/B03/B07/B11/B12/B13部分移植、35组尚未开展**。B04、A10已闭合；B02 CPU、B13 x86 quick GELU、B12 CPU F32 SUM和B11 CUDA PAD均完成独立红绿。已审阅的 Draft PR #156 仍在 `b669a4a`（含 A10/B02 CPU），未包含 B11/B12。“完整移植”不等于所有平台/模型/性能均验收，尤其保留B05 shared-memory动态检测缺口和A11本机未复现旧故障的说明。
 
 | 批次 | 候选 ID | 提交 |
 |---|---|---|
@@ -316,13 +316,14 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 | B02 CPU | CONV_TRANSPOSE_2D多batch、nb13和scratch，Metal待办 | [逐提交验收](operator-acceptance/2026-11-17-b02-cpu-transpose-conv.md)，含独立scatter-add与精确work buffer探针 |
 | B13 x86 quick GELU | F32 GELU_QUICK/GEGLU_QUICK不经F16表；其他helper待办 | [逐提交验收](operator-acceptance/2026-11-17-b13-x86-quick-gelu.md)，含SSE2/AVX2/AVX512、数学oracle与lookup兼容分流 |
 | B12 CPU F32 SUM | 非连续 dim 0；其他后端与 SCALE/unary/GLU 待办 | [逐提交验收](operator-acceptance/2026-11-18-b12-cpu-sum-strides.md)，含独立 oracle 和 offset/空洞探针 |
+| B11 CUDA PAD | 输出行及切片跨过 y/z grid 上限 | [逐提交验收](operator-acceptance/2026-11-18-b11-cuda-pad-grid.md)，含 RTX 5060 启动红绿及 memcheck |
 
 ### 尚未完整移植的清单（完整 ID）
 
 | 分类 | 已移植 / 总数 | 尚未完整移植 |
 |---|---|---|
 | A：单后端局部修补 | 7 / 12 | A01 ARM tile；A03 Metal CPY；A06 TRI；A07 SOLVE_TRI；A12 Metal 64-bit offset |
-| B：配套正确性/helper | 5 / 13，另5组部分完成 | B02剩余Metal transpose-conv；B03剩余Metal GROUP_NORM；B07剩余HIP wave64/BF16 WMMA；B09 Metal FA；B10 CUDA FA/norm/softmax 同步；B11 大 grid；B12 剩余 SUM 后端门控、SCALE/unary/GLU；B13剩余SVE/NEON/AVX512-FP16等helper |
+| B：配套正确性/helper | 5 / 13，另6组部分完成 | B02剩余Metal transpose-conv；B03剩余Metal GROUP_NORM；B07剩余HIP wave64/BF16 WMMA；B09 Metal FA；B10 CUDA FA/norm/softmax 同步；B11 剩余 HIP reflect、CUDA norm/RoPE、Vulkan norm；B12 剩余 SUM 后端门控、SCALE/unary/GLU；B13剩余SVE/NEON/AVX512-FP16等helper |
 | C：backend/类型能力补齐 | 0 / 10 | C01–C10：池化、reflect pad、Metal PAD、SET_ROWS/BF16、卷积/IM2COL、GDN/GLA、OpenCL/WebGPU、量化快路及训练算子 |
 | D：性能组织变化 | 0 / 10 | D01–D10：CPU tiled、紧凑专家 tile、MMQ/少行 matmul、routing/reduce/top-k/FA 融合、ARM repack、移动端及布局/归约优化 |
 | E：公共合同/新能力 | 0 / 8 | E01–E08：precision、跳过 expert ID、RoPE、SSM/GDN 状态、稀疏 FA、新 opcode、模型索引及新格式 |
@@ -338,7 +339,7 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 | 0：先闭合 | B04 CPU FA | 本机AVX2/AVX512剩余切片已收口；B03 Metal、B07 HIP是硬件待办，不用本机代验 |
 | 1：简单CPU局部 | A10已完成 | RMS_NORM_BACK/SOFT_MAX_BACK同一alias合同，实际16/24→24/24；本轮在B04提交后单独完成，未并行扩展其他模块 |
 | 2：其余CPU小切片 | B02 CPU、B13 x86 quick GELU、B12 CPU F32 SUM 已完成 | B12 未改公共合同；SCALE 涉及核心构图断言，暂缓。Metal及特殊ISA继续待办 |
-| 3：GPU局部正确性 | **下一步 B11 CUDA PAD 的 y/z grid**；B12 Vulkan GLU/stride 暂缓 | 先验窄张量跨 65535 行/切片；不带 HIP reflect、CUDA norm/RoPE 或 Vulkan norm。若需大内存或核心API变化则暂缓 |
+| 3：GPU局部正确性 | B11 CUDA PAD 的 y/z grid 已完成；其余小切片单独核对，B12 Vulkan GLU/stride 暂缓 | B11 CUDA PAD 31/31、三条跨界 memcheck 无错误。后续仍先核对设备阈值和小规模复现；若需大内存或核心API变化则暂缓 |
 | 4：复杂GPU同步 | B10 CUDA FA/norm/softmax | 排在简单模块之后，逐kernel切片，必须racecheck/synccheck；不同时展开多个算子族 |
 | 5：后端能力 | C01/C02音频可达项，再选择其他C类 | 先证明模型图可达，分别验kernel、placement和fallback；不因新增kernel就宣称模型收益 |
 | 6：性能/公共合同 | D类、E类 | D须热点及固定预算下收益证据；E须明确模型需求与独立迁移设计，不自动进入实施 |
