@@ -6262,6 +6262,36 @@ struct test_sum : public test_case {
     }
 };
 
+// A packed permutation must sum every backing element exactly once.
+struct test_sum_permuted : public test_sum {
+    test_sum_permuted() : test_sum(GGML_TYPE_F32, {11, 5, 6, 3}, {2, 0, 1, 3}) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_sum::initialize_tensors(ctx);
+        if (mode == MODE_TEST) {
+            ggml_tensor * a = ggml_get_tensor(ctx, "a");
+            std::vector<float> values(ggml_nelements(a));
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = float(i + 1);
+            }
+            ggml_backend_tensor_set(a, values.data(), 0, ggml_nbytes(a));
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (n != 1) {
+            return test_sum::err(a, b, n);
+        }
+        const int64_t count = ne[0]*ne[1]*ne[2]*ne[3];
+        const float expected = count*(count + 1)/2;
+        if (a[0] == expected && b[0] == expected) {
+            return 0.0;
+        }
+        printf("SUM oracle expected=%g actual=(%g,%g) ", expected, a[0], b[0]);
+        return 1.0;
+    }
+};
+
 // GGML_OP_SUM_ROWS
 struct test_sum_rows : public test_case {
     const ggml_type type;
@@ -9434,7 +9464,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 1, 1, 1 }));
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 1024, 1, 1 }));
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 256, 1, 1 }));
-    test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 256, 1, 1 }, { 1, 0, 2, 3 })); // sum dst not-contiguous
+    test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 256, 1, 1 }, { 1, 0, 2, 3 })); // non-contiguous input rows
+    test_cases.emplace_back(new test_sum_permuted());
     test_cases.emplace_back(new test_sum_rows());
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 11, 5, 6, 3 }, true, false));
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 11, 5, 6, 3 }, false, true));
