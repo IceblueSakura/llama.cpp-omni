@@ -1955,7 +1955,7 @@ struct test_unary : public test_case {
     const ggml_unary_op op;
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
-    int v; // view (1 : non-contiguous a)
+    int v; // 1: padded input, 2: in-place, 4: nonzero view offset
 
     std::string vars() override {
         return VARS_TO_STR3(type, ne_a, v);
@@ -1968,9 +1968,9 @@ struct test_unary : public test_case {
         : op(op), type(type), ne_a(ne_a), v(v) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const bool grad_supported = op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_NEG ||
+        const bool grad_supported = !(v & 2) && (op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_NEG ||
             op == GGML_UNARY_OP_STEP || op == GGML_UNARY_OP_RELU || op == GGML_UNARY_OP_SILU ||
-            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS;
+            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS);
 
         ggml_tensor * a;
         if (v & 1) {
@@ -1985,7 +1985,8 @@ struct test_unary : public test_case {
             }
             ggml_set_name(a, "a");
 
-            a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
+            const size_t offset = (v & 4) ? ggml_element_size(a) : 0;
+            a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], offset);
             ggml_set_name(a, "view_of_a");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
@@ -1995,7 +1996,7 @@ struct test_unary : public test_case {
             ggml_set_name(a, "a");
         }
 
-        ggml_tensor * out = ggml_unary(ctx, a, op);
+        ggml_tensor * out = (v & 2) ? ggml_unary_inplace(ctx, a, op) : ggml_unary(ctx, a, op);
         ggml_set_name(out, "out");
 
         return out;
@@ -2088,7 +2089,7 @@ struct test_glu_split : public test_case {
     const ggml_glu_op op;
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
-    int v; // view (1 : non-contiguous a)
+    int v; // 1: padded inputs, 2: different pitches and nonzero offsets
 
     std::string vars() override {
         return VARS_TO_STR3(type, ne_a, v) + ",split";
@@ -2109,15 +2110,20 @@ struct test_glu_split : public test_case {
             ggml_set_param(a);
             ggml_set_name(a, "a");
 
-            a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
+            const size_t offset_a = (v & 2) ? ggml_element_size(a) : 0;
+            a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], offset_a);
             ggml_set_name(a, "view_of_a");
 
+            if (v & 2) {
+                ++ne[0];
+            }
             b = ggml_new_tensor(ctx, type, 4, ne.data());
             ggml_set_param(b);
             ggml_set_name(b, "b");
 
-            b = ggml_view_4d(ctx, b, ne_a[0], ne_a[1], ne_a[2], ne_a[3], b->nb[1], b->nb[2], b->nb[3], 0);
-            ggml_set_name(a, "view_of_b");
+            const size_t offset_b = (v & 2) ? 3*ggml_element_size(b) : 0;
+            b = ggml_view_4d(ctx, b, ne_a[0], ne_a[1], ne_a[2], ne_a[3], b->nb[1], b->nb[2], b->nb[3], offset_b);
+            ggml_set_name(b, "view_of_b");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
             ggml_set_param(a);
@@ -8170,6 +8176,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_unary(GGML_UNARY_OP_NEG, type, { 7, 5, 3, 5 }, 5));
+        test_cases.emplace_back(new test_unary(GGML_UNARY_OP_NEG, type, { 7, 5, 3, 5 }, 7));
         for (int v : {0, 1}) {
             for (int op = 0; op < GGML_UNARY_OP_COUNT; op++) {
                 if (op == GGML_UNARY_OP_XIELU) {
@@ -8202,6 +8210,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_REGLU, type, { 7, 5, 3, 5 }, 3));
         for (int v : {0, 1}) {
             for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
                 if (op == GGML_GLU_OP_SWIGLU_OAI) {
