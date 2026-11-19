@@ -24,7 +24,7 @@
 
 ## 后续批次
 
-- **M2 音频算子通路**：C01 CUDA/Vulkan `POOL_1D`（`29ea9412a`、`876a43211`）及 C02 Vulkan `PAD_REFLECT_1D`（`3f545becc`）；现有 `audition.cpp` / `token2wav-impl.cpp` 可达。测数值、实际设备放置和 fallback；不替换 omni 自有 CUDA 反卷积快路，不带 WebGPU 或目标不可验的 HIP 项。
-- **M3 类型与量化通路**：核对 C04 CPU/CUDA BF16 RMS 与 CPU F16 `SET_ROWS` 的全线程 scratch 依赖，以及 C09 Vulkan 既有量化格式的 MM/MMV/ID。按真实消费者、dispatch 和可验类型分包；不纳入新量化格式或未实测的设备路径。细目来源见[原始调研](upstream-operator-survey.zh.md)。
+- **M2 音频算子通路（已验收）**：C01 CUDA/Vulkan `POOL_1D`（`29ea9412a`、`876a43211`）及 C02 Vulkan `PAD_REFLECT_1D`（`3f545becc`），见[组合验收](operator-acceptance/2026-11-19-m2-audio-pool-reflect.md)。实际 GPU placement 和 CPU fallback 均已用独立预期检查；未替换 omni 自有 CUDA 反卷积快路，未带 WebGPU 或 HIP 项。
+- **M3 类型与量化通路（下一批）**：核对 C04 CPU/CUDA BF16 RMS 与 CPU F16 `SET_ROWS` 的全线程 scratch 依赖，以及 C09 Vulkan 既有量化格式的 MM/MMV/ID。按真实消费者、dispatch 和可验类型分包；不纳入新量化格式或未实测的设备路径。细目来源见[原始调研](upstream-operator-survey.zh.md)。
 
 本文件是执行计划，不是已完成清单；进度及历史验收见[执行记录](upstream-operator-batches.zh.md)。计划、上游差异核对及验收设计有 AI 辅助。

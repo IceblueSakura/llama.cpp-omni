@@ -318,6 +318,7 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 | B12 CPU F32 SUM | 非连续 dim 0；其他后端与 SCALE/unary/GLU 待办 | [逐提交验收](operator-acceptance/2026-11-18-b12-cpu-sum-strides.md)，含独立 oracle 和 offset/空洞探针 |
 | B11 大 grid / dispatch | CUDA PAD/norm、Vulkan RMS_NORM（含融合）及 GROUP_NORM；HIP reflect 待目标环境 | [组验收](operator-acceptance/2026-11-18-b11-dispatch.md)，含 CUDA 动态检测、NVIDIA Vulkan 与 llvmpipe 红绿 |
 | M1 正确性修复包 | B12 CPU/CUDA/Vulkan 布局一致性与 B10 CUDA 执行正确性；SCALE、PDL 大范围改动及非目标后端保留待办 | [组合验收](operator-acceptance/2026-11-19-m1-layout-cuda-correctness.md)，含实际 placement/fallback、Vulkan stride/offset、CUDA FA 与归约 sanitizer 红绿 |
+| M2 音频通路 | C01 CUDA/Vulkan `POOL_1D`、C02 Vulkan `PAD_REFLECT_1D`；不带 WebGPU、ROCm 或 Metal | [组合验收](operator-acceptance/2026-11-19-m2-audio-pool-reflect.md)，含 CPU 旧落点对照、GPU 新落点及 CPU fallback |
 
 ### 尚未完整移植的清单（完整 ID）
 
@@ -333,7 +334,7 @@ export VK_DRIVER_FILES="$MESA/share/vulkan/icd.d/radeon_icd.x86_64.json"
 
 ### 后续队列：按修复包分批推进
 
-**当前计划以[上游算子修复包规划](upstream-operator-packages.zh.md)为准。** 首批 M1 合并交付 B12 布局/能力包与 B10 CUDA 正确性包，优先本机 CPU/CUDA/Vulkan；ROCm/Metal 专用项后置。以下候选组顺序及后续历史交接章节保留原验收背景，不再作为开始新批次的指令。
+**当前计划以[上游算子修复包规划](upstream-operator-packages.zh.md)为准。** M1 正确性和 M2 音频通路已验收，下一批 M3 类型与量化，优先本机 CPU/CUDA/Vulkan；ROCm/Metal 专用项后置。以下候选组顺序及后续历史交接章节保留原验收背景，不再作为开始新批次的指令。
 
 2026-11-18 用户改为按主调研候选组推进，同时只推进一组。组内优先处理依赖少、易复用回归的项目，但不在每个小切片后停下来单独交付。组内有条件的子项统一验收并交付；缺目标硬件或有未解决契约问题的，明确列阻塞与后续条件，不计作已完成。保持既有提交，按[验收约定](operator-acceptance/README.md)维护，公开 PR 由用户另行组织。下面是复杂度档位，不是逐切片交付顺序。
 
