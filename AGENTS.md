@@ -4,7 +4,7 @@ This file defines the current policy for llama.cpp-omni. The inherited llama.cpp
 
 ## Local operator maintenance worktree
 
-For `llama.cpp-omni-operators` / `fix/upstream-operators`, the current local workflow advances one survey candidate group (such as B11 or B12) at a time. Verify its sub-items separately as needed, but consolidate delivery, acceptance notes and ordinarily the local commit by group. Record full upstream commit IDs, adaptations, verification and blocked sub-items under [docs/development/operator-acceptance/](docs/development/operator-acceptance/README.md). Keep existing commits intact. Skip macOS/Metal/MoltenVK and other sub-items without target validation conditions for now. Do not automatically update the PR worktree or remotes; public contribution policy still applies when preparing publication.
+For `llama.cpp-omni-operators` / `fix/upstream-operators`, follow the [backport package plan](docs/development/upstream-operator-packages.zh.md). Integrate dependency-complete packages into one delivery batch and validate the combined tree. Keep a small number of independently revertible local commits and one acceptance record per batch under [docs/development/operator-acceptance/](docs/development/operator-acceptance/README.md). Keep existing commits intact. Prioritize locally testable CPU/CUDA/Vulkan paths; defer ROCm/Metal-specific changes and record untested effects on shared code. Do not automatically update the PR worktree or remotes; public contribution policy still applies when preparing publication.
 
 > [!IMPORTANT]
 > This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
