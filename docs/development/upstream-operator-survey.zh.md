@@ -4,12 +4,12 @@
 
 日期：2026-11-15。状态：**调研记录，尚未实施、构建或在 omni 上验收**。
 
-后续执行状态与分批安排见 [上游算子修复分批记录](upstream-operator-batches.zh.md)。本文保留原始调研口径；候选是否已移植、实测及其版本差异，以执行记录为准。
+后续执行状态、PR 批次规划与暂缓登记见 [主控路线图与 PR 批次看板](upstream-operator-packages.zh.md)。本文保留原始调研口径与稳定 ID 索引；候选是否已移植、实测及其版本差异，以主控路线图为准。
 
 - omni 比较基线：本 worktree 的 `master@350a835d5f8215145aa210a7df0f67e8877b5d6e`。
 - 固定上游：`ggml-org/llama.cpp@61dbf49228c8a96b72e40c89d93cb7c003411f8c`。
 - 本地上游源码：`/home/sakura/codespace/llama.cpp`。本轮未 fetch，不声称覆盖远端最新版本。
-- 当前工作分支：`fix/upstream-operators`，worktree 为 `/home/sakura/workspace/llm/llama.cpp-omni-operators`，从本地 `master` 新建；文档由 `docs/upstream-les-enhancements` worktree 移入。没有合入正在另一会话推进的 LES 分支。
+- 当前工作分支：`fix/upstream-operators`，worktree 为 `/home/sakura/workspace/llm/omni/llama.cpp-omni-operators`，从本地 `master` 新建；没有合入另一分支的 LES 代码。
 - CPU、CUDA/HIP、Vulkan、Metal 完成目录/历史筛查及重点源码比较；OpenCL/WebGPU/Hexagon 是针对性补查。其余后端不宣称逐算子覆盖。
 
 **本文只收录有具体上游提交和代码依据的候选。** 本地额外发现、没有现成上游补丁的疑点，以及需要自行设计的 LES 适配，单独放在 [扩展调研](upstream-operator-extensions.zh.md)，不混入本清单。
