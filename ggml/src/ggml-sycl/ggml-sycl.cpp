@@ -5222,6 +5222,9 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 if (a->type == GGML_TYPE_Q1_0 || b->type == GGML_TYPE_Q1_0) {
                     return false;
                 }
+                if (a->type == GGML_TYPE_TQ1_0 || a->type == GGML_TYPE_TQ2_0) {
+                    return false;
+                }
 
                 if (a->ne[3] != b->ne[3]) {
                     return false;
@@ -5270,7 +5273,8 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
 
         case GGML_OP_SET_ROWS:
             {
-                return ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
+                return op->src[0]->type == GGML_TYPE_F32 &&
+                       ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                          op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q5_0 ||
                          op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_IQ4_NL) &&
                         (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32));
@@ -5383,8 +5387,9 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_NORM:
         case GGML_OP_L2_NORM:
         case GGML_OP_GROUP_NORM:
-        case GGML_OP_RMS_NORM:
             return true;
+        case GGML_OP_RMS_NORM:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_RMS_NORM_BACK:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SCALE:

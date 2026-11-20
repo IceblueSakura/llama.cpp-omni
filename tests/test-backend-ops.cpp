@@ -2350,27 +2350,28 @@ static void init_set_rows_row_ids(ggml_tensor * t, int num_rows) {
 struct test_set_rows : public test_case {
     const ggml_type type;
     const ggml_type type_idx;
+    const ggml_type type_src;
     const std::array<int64_t, 4> ne;
     const std::array<int, 2> nr23; // broadcast only dims 2 and 3
     const int r; // rows to set
     const bool v; // view (non-contiguous src1)
 
     std::string vars() override {
-        return VARS_TO_STR6(type, type_idx, ne, nr23, r, v);
+        return VARS_TO_STR6(type, type_idx, ne, nr23, r, v) + ",type_src=" + ggml_type_name(type_src);
     }
 
     test_set_rows(ggml_type type,
             ggml_type type_idx,
             std::array<int64_t, 4> ne,
             std::array<int, 2> nr23,
-            int r, bool v = false)
-        : type(type), type_idx(type_idx), ne(ne), nr23(nr23), r(r), v(v) {}
+            int r, bool v = false, ggml_type type_src = GGML_TYPE_F32)
+        : type(type), type_idx(type_idx), type_src(type_src), ne(ne), nr23(nr23), r(r), v(v) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * dst = ggml_new_tensor_4d(ctx, type,          ne[0], ne[1], ne[2]*nr23[0], ne[3]*nr23[1]);
         ggml_set_name(dst, "dst");
 
-        ggml_tensor * src = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], r,     ne[2]*nr23[0], ne[3]*nr23[1]);
+        ggml_tensor * src = ggml_new_tensor_4d(ctx, type_src,      ne[0], r,     ne[2]*nr23[0], ne[3]*nr23[1]);
         ggml_set_name(src, "src");
 
         ggml_tensor * row_idxs = ggml_new_tensor_3d(ctx, type_idx, r, ne[2], ne[3]);
@@ -3423,7 +3424,9 @@ struct test_rms_norm : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_set_param(a);
+        if (type == GGML_TYPE_F32) {
+            ggml_set_param(a);
+        }
         ggml_set_name(a, "a");
 
         if (v) {
@@ -8270,6 +8273,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_I64, { 33, 17, 2, 2 }, { 2, 3 }, 13, false, GGML_TYPE_F16));
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_Q8_0 }) {
+        test_cases.emplace_back(new test_set_rows(type, GGML_TYPE_I32, { 256, 17, 2, 2 }, { 2, 3 }, 14, true, GGML_TYPE_F16));
+    }
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -8799,6 +8806,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
 
+    for (int64_t n : { 127, 1024, 1025 }) {
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_BF16, { n, 5, 4, 3 }));
+    }
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_BF16, { 258, 4, 2, 2 }, true));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_BF16, { 127, 5, 4, 3 }, false, 1e-6f, true));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_BF16, { 258, 4, 2, 2 }, true, 1e-6f, true));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_BF16, { 4, 1, 65536, 1 }));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_BF16, { 4, 1, 1, 65536 }));
+
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
         for (uint32_t n : { 64, 1025 }) {
             for (bool v : { false, true }) {
@@ -8934,6 +8950,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_rhs_view(16, false));
     test_cases.emplace_back(new test_mul_mat_rhs_view(4, true));
     test_cases.emplace_back(new test_mul_mat_rhs_view(16, true));
+
+    for (ggml_type type : { GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0 }) {
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 73, 1, 4352, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 129, 19, 768, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 4, 2, false, 73, 1, 768, 81));
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 4, 2, false, 129, 19, 768, 137));
+    }
+    for (ggml_type type : { GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0 }) {
+        test_cases.emplace_back(new test_get_rows(type, 768, 11, 6, 2, 2, true));
+    }
 
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 1, 256));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 512, 1, 512));

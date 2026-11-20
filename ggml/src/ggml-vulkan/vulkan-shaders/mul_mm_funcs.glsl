@@ -163,6 +163,37 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             buf_a[buf_idx    ] = FLOAT_TYPEV2(v.xy);
             buf_a[buf_idx + 1] = FLOAT_TYPEV2(v.zw);
+#elif defined(DATA_A_TQ1_0)
+            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+
+            const uint ib  = idx / 128;
+            const uint iqs = (idx % 128) * 2;
+            const float d = float(data_a[ib].d);
+            vec2 v;
+            [[unroll]] for (uint kk = 0; kk < 2; ++kk) {
+                const uint e = iqs + kk;
+                const uint bidx = tq1_0_byte_of(e);
+                const uint qbyte = uint(bidx < 48u ? data_a[ib].qs[bidx] : data_a[ib].qh[bidx - 48u]);
+                v[kk] = d * (float(tq1_0_trit(qbyte, tq1_0_digit_of(e))) - 1.0);
+            }
+            buf_a[buf_idx] = FLOAT_TYPEV2(v);
+#elif defined(DATA_A_TQ2_0)
+            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+
+            const uint ib = idx / 128;                         // 2 values per idx
+            const uint iqs = (idx % 128) * 2;                  // elem 0,2,4..254
+
+            const uint qsi   = (iqs / 128) * 32 + (iqs % 32);  // byte pair start
+            const uint shift = 2 * ((iqs % 128) / 32);         // 0,2,4,6
+
+            const uvec2 qs = uvec2(data_a[ib].qs[qsi], data_a[ib].qs[qsi + 1]);
+            const float d = float(data_a[ib].d);
+
+            const vec2 v = d * (vec2((qs >> shift) & 3) - 1.0);
+
+            buf_a[buf_idx] = FLOAT_TYPEV2(v.xy);
 #elif defined(DATA_A_Q3_K)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;

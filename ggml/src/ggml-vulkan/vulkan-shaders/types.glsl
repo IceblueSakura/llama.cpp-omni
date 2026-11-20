@@ -274,6 +274,65 @@ struct block_q2_K_packed32
 #define DATA_A_QUANT_K
 #endif
 
+#define QUANT_K_TQ1_0 256
+
+// TQ1_0: base-3 packed trits, 5 per byte in `qs` (48B) and 4 in `qh` (4B).
+struct block_tq1_0
+{
+    uint8_t qs[(QUANT_K_TQ1_0 - 4 * QUANT_K_TQ1_0 / 64) / 5];
+    uint8_t qh[QUANT_K_TQ1_0 / 64];
+    float16_t d;
+};
+
+// Element e in [0,255] -> its packed byte (0..47 qs, 48..51 qh) and digit.
+uint tq1_0_byte_of(uint e) {
+    return e < 160u ? (e % 32u)
+         : e < 240u ? 32u + ((e - 160u) % 16u)
+         : 48u + ((e - 240u) % 4u);
+}
+uint tq1_0_digit_of(uint e) {
+    return e < 160u ? (e / 32u)
+         : e < 240u ? ((e - 160u) / 16u)
+         : ((e - 240u) / 4u);
+}
+// The 8-bit truncation below is part of the format, not an optimisation:
+// the C reference does `uint8_t q = qs[..] * pow3[n]`.
+uint tq1_0_trit(uint qbyte, uint t) {
+    const uint POW3_PACKED = (1u << 28) | (3u << 21) | (9u << 14) | (27u << 7) | 81u;
+    return ((((qbyte * ((POW3_PACKED >> (7u * (4u - t))) & 0x7Fu)) & 255u) * 3u) >> 8);
+}
+
+#if defined(DATA_A_TQ1_0)
+#define QUANT_K QUANT_K_TQ1_0
+#define QUANT_R 1
+#define A_TYPE block_tq1_0
+#define DATA_A_QUANT_K
+#endif
+
+#define QUANT_K_TQ2_0 256
+
+// ternary (BitNet): 2-bit codes, w = (q - 1) * d; qs layout matches q2_K's
+// two 32-byte groups with four bit-levels per byte
+struct block_tq2_0
+{
+    uint8_t qs[QUANT_K_TQ2_0/4];
+    float16_t d;
+};
+
+struct block_tq2_0_packed16
+{
+    uint16_t qs[QUANT_K_TQ2_0/4/2];
+    float16_t d;
+};
+
+#if defined(DATA_A_TQ2_0)
+#define QUANT_K QUANT_K_TQ2_0
+#define QUANT_R 1
+#define A_TYPE block_tq2_0
+#define A_TYPE_PACKED16 block_tq2_0_packed16
+#define DATA_A_QUANT_K
+#endif
+
 #define QUANT_K_Q3_K 256
 
 struct block_q3_K
@@ -1744,17 +1803,35 @@ const int8_t kvalues_iq4nl_const[16] = {
     int8_t(1), int8_t(13), int8_t(25), int8_t(38), int8_t(53), int8_t(69), int8_t(89), int8_t(113)
 };
 
+#ifdef KVALUES_IQ4NL_I8
+shared int8_t kvalues_iq4nl[16];
+#else
 shared FLOAT_TYPE kvalues_iq4nl[16];
+#endif
 
 #define NEEDS_INIT_IQ_SHMEM
 void init_iq_shmem(uvec3 wgsize)
 {
     // copy the table into shared memory and sync
     for (uint i = gl_LocalInvocationIndex.x; i < kvalues_iq4nl.length(); i += wgsize.x) {
+#ifdef KVALUES_IQ4NL_I8
+        kvalues_iq4nl[i] = kvalues_iq4nl_const[i];
+#else
         kvalues_iq4nl[i] = FLOAT_TYPE(kvalues_iq4nl_const[i]);
+#endif
     }
     barrier();
 }
+
+#ifdef KVALUES_IQ4NL_I8
+i32vec2 iq4nl_to_i8x8(uint32_t vui) {
+    const u8vec4 i0 = unpack8( vui       & 0x0F0F0F0F);
+    const u8vec4 i1 = unpack8((vui >> 4) & 0x0F0F0F0F);
+    return i32vec2(
+        pack32(i8vec4(kvalues_iq4nl[i0.x], kvalues_iq4nl[i0.y], kvalues_iq4nl[i0.z], kvalues_iq4nl[i0.w])),
+        pack32(i8vec4(kvalues_iq4nl[i1.x], kvalues_iq4nl[i1.y], kvalues_iq4nl[i1.z], kvalues_iq4nl[i1.w])));
+}
+#endif
 #endif
 
 #if defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)

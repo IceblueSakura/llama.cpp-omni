@@ -3696,11 +3696,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             add = cgraph->nodes[node_idx+2];
         }
 
-        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
-
-        //rms norm only supports F32
-        if (mul->src[0]->type != GGML_TYPE_F32 ||
+        if (rms_norm->src[0]->type != GGML_TYPE_F32 ||
+            rms_norm->type != GGML_TYPE_F32 ||
+            mul->src[0]->type != GGML_TYPE_F32 ||
             mul->src[1]->type != GGML_TYPE_F32 ||
             mul->type != GGML_TYPE_F32) {
             return false;
@@ -5336,11 +5334,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
             break;
         case GGML_OP_NORM:
-        case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
             return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous(op);
+        case GGML_OP_RMS_NORM: {
+            const auto * src = op->src[0];
+            bool supported_type = src->type == GGML_TYPE_F32;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            supported_type |= src->type == GGML_TYPE_BF16;
+#endif
+            return supported_type && src->type == op->type && src->nb[0] == ggml_type_size(src->type) &&
+                ggml_is_contiguous_rows(src) && ggml_is_contiguous(op);
+        }
         case GGML_OP_RMS_NORM_BACK:
-            return ggml_is_contiguous(op->src[0]);
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
             break;
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
