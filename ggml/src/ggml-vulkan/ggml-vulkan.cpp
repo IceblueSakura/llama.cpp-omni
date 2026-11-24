@@ -3206,8 +3206,13 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
 
-    if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+    if (!reduce_block_rows && result.block_rows > 1 &&
+        !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
         result.block_rows /= 2;
+    }
+
+    if (result.shmem_staging && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+        result.shmem_staging = false;
     }
 
     // On AMD RDNA, for small head sizes and big batch size the shader uses few registers, so too many subgroups get scheduled
@@ -7670,10 +7675,26 @@ static void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, siz
         return;
     }
 
+    // vkCmdFillBuffer requires a 4-byte aligned offset and size.
+    const size_t end           = offset + size;
+    const size_t begin_aligned = std::min(GGML_PAD(offset, 4), end);
+    const size_t end_aligned   = std::max(end - end % 4, begin_aligned);
+
+    const uint8_t * c_bytes = (const uint8_t *) &c;
+    if (begin_aligned > offset) {
+        ggml_vk_buffer_write(dst, offset, c_bytes + offset % 4, begin_aligned - offset);
+    }
+    if (end > end_aligned) {
+        ggml_vk_buffer_write(dst, end_aligned, c_bytes, end - end_aligned);
+    }
+    if (end_aligned == begin_aligned) {
+        return;
+    }
+
     std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
     vk_context subctx = ggml_vk_create_temporary_context(dst->device->transfer_queue.cmd_pool);
     ggml_vk_ctx_begin(dst->device, subctx);
-    subctx->s->buffer->buf.fillBuffer(dst->buffer, offset, size, c);
+    subctx->s->buffer->buf.fillBuffer(dst->buffer, begin_aligned, end_aligned - begin_aligned, c);
     ggml_vk_ctx_end(subctx);
 
     ggml_vk_submit(subctx, dst->device->fence);
@@ -9573,7 +9594,8 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
         kblocksh_size = 0;
     }
 
-    const uint32_t total_size = tmpsh + tmpshv4 + masksh + Qf + kvsh + kblocksh_size;
+    const uint32_t occupancy_limiter = std::max(params.limit_occupancy_shmem, 1u) * 4 * sizeof(float);
+    const uint32_t total_size = tmpsh + tmpshv4 + masksh + Qf + kvsh + kblocksh_size + occupancy_limiter;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
     VK_LOG_DEBUG("ggml_vk_flash_attn_scalar_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", mmq=" << mmq << ", total_size=" << total_size << ", supported=" << supported);
@@ -14527,7 +14549,8 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
 static void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
-    ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, buffer->size);
+    const uint32_t val32 = (uint32_t)value * 0x01010101;
+    ggml_vk_buffer_memset(ctx->dev_buffer, 0, val32, buffer->size);
 }
 
 static ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
