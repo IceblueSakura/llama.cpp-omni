@@ -1079,6 +1079,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_slots        (params.moe_slots),
     moe_decode_phase (params.moe_decode_phase),
      moe_single_slot  (params.moe_single_slot),
+    moe_l1_phase     (params.moe_l1_phase),
     cross            (params.cross),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -1502,7 +1503,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s) const {
-    if (moe_slots && !moe_single_slot && moe_slots->uses_layer(il)) {
+    const auto * l1_banks = moe_l1_phase && !gate_up_exps && gate_exps && up_exps && down_exps &&
+        !gate_up_exps_b && !gate_exps_b && !up_exps_b && !down_exps_b && !gate_exps_s && !up_exps_s && !down_exps_s &&
+        n_expert_used == hparams.n_expert_used ? moe_slots->vulkan_l1_banks(il) : nullptr;
+    if (l1_banks) {
+        gate_exps = (*l1_banks)[0];
+        up_exps   = (*l1_banks)[1];
+        down_exps = (*l1_banks)[2];
+    } else if (moe_slots && !moe_single_slot && moe_slots->uses_layer(il)) {
         gate_up_exps = moe_slots->bank_tensor(gate_up_exps, moe_decode_phase);
         gate_exps    = moe_slots->bank_tensor(gate_exps, moe_decode_phase);
         up_exps      = moe_slots->bank_tensor(up_exps, moe_decode_phase);
@@ -1662,7 +1670,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         !up_exps_s && !gate_exps_s && !down_exps_s &&
         (int) n_expert_used > moe_slots->matmul_split();
     ggml_tensor * selected_experts_mm = selected_experts;
-    if (moe_slots && moe_slots->uses_layer(il)) {
+    if (l1_banks) {
+        selected_experts_mm = moe_slots->build_vulkan_l1_ids(ctx0, sched, backend_cpu, selected_experts, il);
+        cb(selected_experts_mm, "ffn_moe_slots_l1", il);
+    } else if (moe_slots && moe_slots->uses_layer(il)) {
         selected_experts_mm = moe_slots->build_slot_ids_tensor(ctx0, selected_experts, il, split_moe);
         cb(selected_experts_mm, "ffn_moe_slots", il);
     }

@@ -144,7 +144,8 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                                bool l1_decode = false);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -264,7 +265,8 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                                    bool   l1_decode = false) const;
 
     llm_graph_cb graph_get_cb() const;
 
@@ -286,7 +288,7 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
     std::unique_ptr<llama_moe_slot_runtime> moe_slots;
-    bool moe_single_slot_context_invalid = false;
+    bool moe_context_invalid = false;
     ggml_backend_sched_ptr sched;
 
     llama_cparams cparams;

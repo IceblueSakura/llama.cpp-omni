@@ -610,6 +610,7 @@ struct llm_graph_params {
     // n_tokens 不足以区分：单 token 的 prefill 与 decode 都是 1。
     bool moe_decode_phase = false;
     bool moe_single_slot = false;
+    bool moe_l1_phase = false;
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -702,6 +703,7 @@ struct llm_graph_params {
             moe_slots == other.moe_slots &&
             moe_decode_phase == other.moe_decode_phase &&
             moe_single_slot == other.moe_single_slot &&
+            moe_l1_phase == other.moe_l1_phase &&
             cross == other.cross;
     }
 };
@@ -841,6 +843,7 @@ struct llm_graph_context {
     llama_moe_slot_runtime       * moe_slots;
     bool                           moe_decode_phase;
     bool                           moe_single_slot;
+    bool                           moe_l1_phase;
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;

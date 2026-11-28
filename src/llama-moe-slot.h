@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <array>
 #include <memory>
 #include <map>
 #include <functional>
@@ -36,6 +37,10 @@ public:
     bool has_single_slot() const;
     ggml_tensor * build_single_slot(ggml_context * ctx, ggml_tensor * input,
                                    ggml_tensor * expert_ids, ggml_tensor * weights, int layer);
+    bool has_vulkan_l1() const;
+    const std::array<ggml_tensor *, 3> * vulkan_l1_banks(int layer) const;
+    ggml_tensor * build_vulkan_l1_ids(ggml_context * ctx, ggml_backend_sched_t sched,
+                                     ggml_backend_t cpu, ggml_tensor * expert_ids, int layer);
     bool lookahead_prefetch_enabled() const;
     int  lookahead_prefetch_depth() const;
     /// 每层 decode 窗口宽度（slot 数）。0 = 未启用按层窗口。
@@ -115,6 +120,7 @@ public:
     void prewarm_experts();
 
 private:
+    static void map_vulkan_l1(ggml_tensor * dst, const ggml_tensor * src, int ith, int nth, void * userdata);
     static void map_custom_lookahead_only(
         ggml_tensor * dst,
         const ggml_tensor * pred,

@@ -98,6 +98,14 @@ static bool park_window_enabled() {
     return e[0] != '0';
 }
 
+static ggml_backend_buffer_type_t vulkan_same_device_host_buft(ggml_backend_dev_t dev) {
+    auto * host = ggml_backend_dev_host_buffer_type(dev);
+    // Vulkan currently exposes its pinned allocator for the first device only.
+    // An allocation must be registered on the same device that submits the copy.
+    return host && ggml_backend_buft_get_device(host) == dev && ggml_backend_buft_is_host_addressable(host)
+        ? host : nullptr;
+}
+
 static ggml_backend_buffer_type_t vulkan_pinned_staging_type(const llama_model & model) {
     const char * env = std::getenv("LLAMA_MOE_VK_PINNED_STAGING");
     if (!env || std::strcmp(env, "1") != 0) {
@@ -120,11 +128,7 @@ static ggml_backend_buffer_type_t vulkan_pinned_staging_type(const llama_model &
             return nullptr;
         }
     }
-    auto * host = ggml_backend_dev_host_buffer_type(dev);
-    // Vulkan currently exposes its pinned allocator for the first device only.
-    // An allocation must be registered on the same device that submits the copy.
-    return host && ggml_backend_buft_get_device(host) == dev && ggml_backend_buft_is_host_addressable(host)
-        ? host : nullptr;
+    return vulkan_same_device_host_buft(dev);
 }
 
 using metal_buf_fn = bool (*)(ggml_backend_buffer_t);
@@ -737,6 +741,40 @@ struct llama_moe_slot_runtime::impl {
         bool defer = false;
     };
 
+    struct l1_layer {
+        struct slot {
+            int32_t expert = -1;
+            uint64_t age = 0;
+        };
+        map_userdata userdata;
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buffer;
+        ggml_backend_t backend = nullptr;
+        std::array<ggml_tensor *, 3> banks{};
+        std::array<size_t, 3> offsets{};
+        size_t span = 0;
+        std::vector<slot> slots;
+        std::vector<int32_t> expert_to_slot;
+        uint64_t age = 0;
+        uint64_t hits = 0, misses = 0, evictions = 0, uploaded = 0, all_hit = 0;
+    };
+    // A1 is deliberately two independent layer banks. No sharing, prefetch,
+    // scheduler changes or pipeline overlap until this path is measured.
+    std::array<std::unique_ptr<l1_layer>, 2> l1;
+    ggml_backend_buffer_ptr l1_pinned_buf;
+    std::vector<uint8_t> l1_cpu_scratch;
+    size_t l1_scratch_stride = 0;
+    bool l1_trace = false;
+
+    l1_layer * find_l1(int layer) const {
+        for (const auto & bank : l1) {
+            if (bank && bank->userdata.layer == layer) {
+                return bank.get();
+            }
+        }
+        return nullptr;
+    }
+
     struct pending_install {
         int32_t expert = -1;
         int32_t slot = -1;
@@ -1066,6 +1104,206 @@ struct llama_moe_slot_runtime::impl {
         }
         sweep_init();
         prewarm_init();
+        init_vulkan_l1();
+    }
+
+    void init_vulkan_l1() {
+        const char * env = std::getenv("LLAMA_MOE_VK_L1_SLOTS");
+        if (!env || !*env || std::strcmp(env, "0") == 0) {
+            return;
+        }
+        try {
+            char * end = nullptr;
+            errno = 0;
+            const long slots = std::strtol(env, &end, 10);
+            const auto n_used = model.hparams.n_expert_used;
+            if (errno == ERANGE || *end || slots <= 0 || slots > n_expert || n_used == 0 ||
+                    size_t(slots) < n_used) {
+                throw std::runtime_error("slots must be between the model's top-k and expert count");
+            }
+            if (!storage.requires_upload() || model.hparams.no_alloc || decode_window != 0 ||
+                    model.devices.size() != 1 || model.devices.front().is_meta) {
+                throw std::runtime_error("requires single-device staged LES with the Host decode window disabled");
+            }
+            auto * dev = model.devices.front().dev;
+            auto * reg = ggml_backend_dev_backend_reg(dev);
+            if (!reg || std::strcmp(ggml_backend_reg_name(reg), "Vulkan") != 0 ||
+                    ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                throw std::runtime_error("requires a discrete Vulkan device");
+            }
+            auto * buft = ggml_backend_dev_buffer_type(dev);
+            if (ggml_backend_buft_is_host_addressable(buft)) {
+                throw std::runtime_error("requires device-local Vulkan expert banks");
+            }
+            std::array<std::unique_ptr<l1_layer>, 2> pending;
+            size_t count = 0, bytes = 0, scratch = 0;
+            for (size_t il = 0; il < layers.size() && count < pending.size(); ++il) {
+                const auto & state = layers[il];
+                const auto & ml = model.layers[il];
+                if (!state.pack_ok || state.bindings.size() != 3 || model.dev_layer(il) != dev ||
+                        !ml.ffn_gate_exps || !ml.ffn_up_exps || !ml.ffn_down_exps ||
+                        ml.ffn_gate_up_exps || ml.ffn_gate_exps_s || ml.ffn_up_exps_s || ml.ffn_down_exps_s) {
+                    continue;
+                }
+                auto bank = std::make_unique<l1_layer>();
+                bank->userdata.layer = int(il);
+                // One shared ID tensor and an input/operation probe per family.
+                bank->ctx.reset(ggml_init({3 * ggml_tensor_overhead(), nullptr, true}));
+                ggml_context_ptr probe(ggml_init({7 * ggml_tensor_overhead(), nullptr, true}));
+                if (!bank->ctx || !probe) {
+                    throw std::runtime_error("failed to allocate L1 metadata");
+                }
+                auto * ids = ggml_new_tensor_2d(probe.get(), GGML_TYPE_I32, n_used, 1);
+                const ggml_tensor * weights[] = {ml.ffn_gate_exps, ml.ffn_up_exps, ml.ffn_down_exps};
+                for (size_t f = 0; f < bank->banks.size(); ++f) {
+                    const auto * w = weights[f];
+                    const auto * e = model.moe_experts_entry(ggml_get_name(w));
+                    GGML_ASSERT(e && e->offset >= state.pack_base);
+                    auto * t = ggml_new_tensor_3d(bank->ctx.get(), w->type, w->ne[0], w->ne[1], slots);
+                    if (t->nb[2] != e->bytes_per_expert) {
+                        throw std::runtime_error("incompatible Vulkan L1 expert stride");
+                    }
+                    ggml_format_name(t, "les_vk_l1-%zu.%zu", il, f);
+                    auto * input = ggml_new_tensor_3d(probe.get(), GGML_TYPE_F32, w->ne[0], f == 2 ? n_used : 1, 1);
+                    if (!ggml_backend_dev_supports_op(dev, ggml_mul_mat_id(probe.get(), t, input, ids))) {
+                        throw std::runtime_error("Vulkan L1 weight shape is not supported by MUL_MAT_ID");
+                    }
+                    bank->banks[f] = t;
+                    bank->offsets[f] = e->offset - state.pack_base;
+                    bank->span = std::max(bank->span, bank->offsets[f] + e->bytes_per_expert);
+                }
+                bank->buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(bank->ctx.get(), buft));
+                if (!bank->buffer) {
+                    throw std::runtime_error("failed to allocate Vulkan L1 weights");
+                }
+                ggml_backend_buffer_set_usage(bank->buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                ggml_backend_buffer_clear(bank->buffer.get(), 0);
+                bank->slots.resize(slots);
+                bank->expert_to_slot.assign(n_expert, -1);
+                bytes += ggml_backend_buffer_get_size(bank->buffer.get());
+                scratch = std::max(scratch, bank->span);
+                pending[count++] = std::move(bank);
+            }
+            if (count != pending.size()) {
+                throw std::runtime_error("need two packed Vulkan gate/up/down layers");
+            }
+            if (scratch > SIZE_MAX / n_used) {
+                throw std::runtime_error("Vulkan L1 scratch size overflow");
+            }
+            const size_t scratch_bytes = scratch * n_used;
+            auto * host = vulkan_same_device_host_buft(dev);
+            if (host && scratch_bytes <= ggml_backend_buft_get_max_size(host)) {
+                l1_pinned_buf.reset(ggml_backend_buft_alloc_buffer(host, scratch_bytes));
+                // The Vulkan allocator itself can return a pageable CPU buffer.
+                if (l1_pinned_buf && ggml_backend_buffer_get_type(l1_pinned_buf.get()) != host) {
+                    l1_pinned_buf.reset();
+                }
+            }
+            if (!l1_pinned_buf) {
+                l1_cpu_scratch.resize(scratch_bytes);
+            }
+            l1_scratch_stride = scratch;
+            const char * trace = std::getenv("LLAMA_MOE_VK_L1_TRACE");
+            l1_trace = trace && std::strcmp(trace, "1") == 0;
+            l1 = std::move(pending);
+            const size_t allocated = l1_pinned_buf ? ggml_backend_buffer_get_size(l1_pinned_buf.get()) : l1_cpu_scratch.size();
+            moe_log("Vulkan L1: layers=%d,%d slots/layer=%ld device_bytes=%zu scratch=%.2f MiB (%s)",
+                    l1[0]->userdata.layer, l1[1]->userdata.layer, slots, bytes, allocated / 1048576.0,
+                    l1_pinned_buf ? "pinned" : "cpu-fallback");
+        } catch (const std::exception & e) {
+            moe_log("Vulkan L1 unavailable; using staged LES: %s", e.what());
+        }
+    }
+
+    void install_l1(l1_layer & bank, const ggml_tensor * src, ggml_tensor * dst) {
+        GGML_ASSERT(bank.backend && src->ne[1] == 1 && src->ne[0] == model.hparams.n_expert_used);
+        const auto & state = layers[bank.userdata.layer];
+        std::vector<int32_t> experts;
+        read_i32_ids(src, experts);
+        const auto hits_before = bank.hits, misses_before = bank.misses, bytes_before = bank.uploaded;
+        struct miss {
+            int32_t expert;
+            int32_t slot;
+        };
+        std::vector<miss> misses;
+        for (int32_t e : experts) {
+            if (e < 0 || e >= n_expert) {
+                throw std::runtime_error("Vulkan L1 routed expert out of range");
+            }
+            if (bank.expert_to_slot[e] < 0 && std::none_of(misses.begin(), misses.end(),
+                    [e](const miss & m) { return m.expert == e; })) {
+                misses.push_back({e, -1});
+            }
+        }
+
+        uint8_t * scratch = nullptr;
+        if (!misses.empty()) {
+            scratch = l1_pinned_buf ? (uint8_t *) ggml_backend_buffer_get_base(l1_pinned_buf.get()) : l1_cpu_scratch.data();
+            const int fd = fd_for(state.pack_path);
+            // A failed read leaves the bank, including its LRU order, untouched.
+            for (size_t m = 0; m < misses.size(); ++m) {
+                struct iovec iov{scratch + m * l1_scratch_stride, bank.span};
+                readv_span(fd, state.pack_base + size_t(misses[m].expert) * state.pack_stride, &iov, 1);
+            }
+        }
+
+        const uint64_t age = ++bank.age;
+        for (int32_t e : experts) {
+            const int32_t index = bank.expert_to_slot[e];
+            if (index >= 0) {
+                bank.slots[index].age = age;
+                ++bank.hits;
+            }
+        }
+        if (!misses.empty()) {
+            // Drain any GPU readers of the slots about to be overwritten.
+            ggml_backend_synchronize(bank.backend);
+            for (size_t m = 0; m < misses.size(); ++m) {
+                auto victim = std::min_element(bank.slots.begin(), bank.slots.end(),
+                        [](const l1_layer::slot & a, const l1_layer::slot & b) { return a.age < b.age; });
+                GGML_ASSERT(victim->age < age); // protect hits and already claimed slots
+                victim->age = age;
+                const int32_t index = int32_t(victim - bank.slots.begin());
+                misses[m].slot = index;
+                for (size_t f = 0; f < bank.banks.size(); ++f) {
+                    auto * t = bank.banks[f];
+                    const auto * payload = scratch + m * l1_scratch_stride + bank.offsets[f];
+                    const size_t offset = size_t(index) * t->nb[2];
+                    if (l1_pinned_buf) {
+                        ggml_backend_tensor_set_async(bank.backend, t, payload, offset, t->nb[2]);
+                    } else {
+                        ggml_backend_tensor_set(t, payload, offset, t->nb[2]);
+                    }
+                    bank.uploaded += t->nb[2];
+                }
+            }
+            if (l1_pinned_buf) {
+                // Publish only after all copies complete, before another layer reuses scratch.
+                ggml_backend_synchronize(bank.backend);
+            }
+            for (const auto & m : misses) {
+                auto & slot = bank.slots[m.slot];
+                if (slot.expert >= 0) {
+                    bank.expert_to_slot[slot.expert] = -1;
+                    ++bank.evictions;
+                }
+                slot.expert = m.expert;
+                bank.expert_to_slot[m.expert] = m.slot;
+            }
+            bank.misses += misses.size();
+        } else {
+            ++bank.all_hit;
+        }
+        for (int32_t & e : experts) {
+            e = bank.expert_to_slot[e];
+        }
+        write_i32_ids(dst, experts);
+        if (l1_trace) {
+            moe_log("Vulkan L1 token layer=%d step=%llu hits=%llu misses=%llu payload=%llu evictions_total=%llu",
+                    bank.userdata.layer, (unsigned long long) age, (unsigned long long) (bank.hits - hits_before),
+                    (unsigned long long) (bank.misses - misses_before), (unsigned long long) (bank.uploaded - bytes_before),
+                    (unsigned long long) bank.evictions);
+        }
     }
 
     bool init_single_slot() {
@@ -2718,6 +2956,48 @@ struct llama_moe_slot_runtime::impl {
     }
 };
 
+void llama_moe_slot_runtime::map_vulkan_l1(ggml_tensor * dst, const ggml_tensor * src, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith == 0) {
+        auto & bank = *static_cast<impl::l1_layer *>(userdata);
+        auto & p = *bank.userdata.runtime->pimpl;
+        try {
+            p.install_l1(bank, src, dst);
+        } catch (...) {
+            // The CPU backend abort callback stops this graph before the next
+            // GPU split can consume a remap that was not produced.
+            p.capture_failure();
+        }
+    }
+}
+
+bool llama_moe_slot_runtime::has_vulkan_l1() const {
+    return pimpl->l1.front() != nullptr;
+}
+
+const std::array<ggml_tensor *, 3> * llama_moe_slot_runtime::vulkan_l1_banks(int layer) const {
+    const auto * bank = pimpl->find_l1(layer);
+    return bank ? &bank->banks : nullptr;
+}
+
+ggml_tensor * llama_moe_slot_runtime::build_vulkan_l1_ids(ggml_context * ctx, ggml_backend_sched_t sched,
+                                                        ggml_backend_t cpu, ggml_tensor * expert_ids, int layer) {
+    auto * bank = pimpl->find_l1(layer);
+    GGML_ASSERT(bank && cpu);
+    auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(bank->buffer.get()));
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        auto * backend = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_get_device(backend) == dev) {
+            bank->backend = backend;
+            bank->userdata.runtime = this;
+            auto * ids = ggml_map_custom1(ctx, expert_ids, map_vulkan_l1, 1, bank);
+            ggml_backend_sched_set_tensor_backend(sched, ids, cpu);
+            return ids;
+        }
+    }
+    GGML_ABORT("Vulkan L1 device missing from scheduler");
+}
+
 void llama_moe_slot_runtime::map_custom(
         ggml_tensor * dst,
         const ggml_tensor * src,
@@ -2772,7 +3052,16 @@ llama_moe_slot_runtime::llama_moe_slot_runtime(const llama_model & model,
     }
 }
 
-llama_moe_slot_runtime::~llama_moe_slot_runtime() = default;
+llama_moe_slot_runtime::~llama_moe_slot_runtime() {
+    for (const auto & bank : pimpl->l1) {
+        if (bank) {
+            moe_log("Vulkan L1 summary layer=%d hits=%llu misses=%llu all_hit=%llu evictions=%llu payload=%llu",
+                    bank->userdata.layer, (unsigned long long) bank->hits, (unsigned long long) bank->misses,
+                    (unsigned long long) bank->all_hit, (unsigned long long) bank->evictions,
+                    (unsigned long long) bank->uploaded);
+        }
+    }
+}
 
 ggml_tensor * llama_moe_slot_runtime::bank_tensor(const ggml_tensor * tensor, bool decode) const {
     if (!tensor) {
@@ -2806,7 +3095,13 @@ bool llama_moe_slot_runtime::copy_weights(ggml_backend_t backend, const ggml_ten
 }
 
 uint64_t llama_moe_slot_runtime::uploaded_bytes() const {
-    return pimpl->storage.uploaded_bytes() + (pimpl->stream ? pimpl->stream->uploaded : 0);
+    uint64_t bytes = pimpl->storage.uploaded_bytes() + (pimpl->stream ? pimpl->stream->uploaded : 0);
+    for (const auto & bank : pimpl->l1) {
+        if (bank) {
+            bytes += bank->uploaded;
+        }
+    }
+    return bytes;
 }
 
 bool llama_moe_slot_runtime::failed() const {
@@ -2843,6 +3138,16 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_slot_runtime::memory_brea
     auto result = pimpl->storage.memory_breakdown();
     if (pimpl->pred_buft && pimpl->pred_bytes > 0) {
         result[pimpl->pred_buft] += pimpl->pred_bytes;
+    }
+    for (const auto & bank : pimpl->l1) {
+        if (bank) {
+            result[ggml_backend_buffer_get_type(bank->buffer.get())] += ggml_backend_buffer_get_size(bank->buffer.get());
+        }
+    }
+    if (const auto & buf = pimpl->l1_pinned_buf) {
+        result[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+    } else if (!pimpl->l1_cpu_scratch.empty()) {
+        result[ggml_backend_cpu_buffer_type()] += pimpl->l1_cpu_scratch.size();
     }
     if (const auto & s = pimpl->stream) {
         result[ggml_backend_cpu_buffer_type()] += s->host_scratch_bytes();

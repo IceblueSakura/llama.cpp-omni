@@ -1478,7 +1478,8 @@ struct fw_probe_guard {
 };
 } // namespace
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype,
+                                               llama_memory_context_i * mctx, ggml_status & ret, bool l1_decode) {
     if (moe_slots) {
         moe_slots->ensure_unparked();
     }
@@ -1505,7 +1506,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const auto gparams = graph_params(res, ubatch, mctx, gtype, l1_decode);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1883,8 +1884,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    if (moe_single_slot_context_invalid) {
-        LLAMA_LOG_ERROR("%s: recreate context after an interrupted Vulkan single-slot graph\n", __func__);
+    if (moe_context_invalid) {
+        LLAMA_LOG_ERROR("%s: recreate context after an interrupted Vulkan LES graph\n", __func__);
         return -3;
     }
     // MTP hook batches carry both token (next-token id) and embd (h_pre_norm row),
@@ -2049,7 +2050,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        // A one-row tail of a larger prompt is not a decode cache request.
+        const bool l1_decode = moe_slots && moe_slots->has_vulkan_l1() &&
+            !cparams.warmup && !cparams.pipeline_parallel && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+            loras->empty() && n_tokens_all == 1 && ubatch.n_tokens == 1 && ubatch.token && !ubatch.embd &&
+            ubatch.n_seq_id[0] == 1 && ubatch.pos[0] > 0;
+        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, l1_decode);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2074,11 +2080,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 memory->seq_rm(s, pos_min[s], -1);
             }
 
-            if (moe_slots && moe_slots->has_single_slot()) {
+            if (moe_slots && (moe_slots->has_single_slot() || l1_decode)) {
                 // seq_rm success does not guarantee a replayable recurrent
                 // state after an interrupted graph, even at prompt position 0.
-                moe_single_slot_context_invalid = true;
-                LLAMA_LOG_ERROR("%s: interrupted Vulkan single-slot graph invalidated the context\n", __func__);
+                moe_context_invalid = true;
+                LLAMA_LOG_ERROR("%s: interrupted Vulkan LES %s graph invalidated the context\n",
+                        __func__, l1_decode ? "L1" : "single-slot");
             }
 
             switch (status) {
@@ -2597,7 +2604,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type), ubatch.n_tokens == 1);
 
     res->reset();
 
@@ -2625,7 +2632,8 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                                    bool   l1_decode) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2649,6 +2657,8 @@ llm_graph_params llama_context::graph_params(
                                 ubatch.n_tokens <= moe_slots->window_max_rows(),
         // Use the same expert workspace in reservation, prefill and decode.
         /*.moe_single_slot =*/ gtype == LLM_GRAPH_TYPE_DEFAULT && moe_slots && moe_slots->has_single_slot(),
+        /*.moe_l1_phase =*/ l1_decode && gtype == LLM_GRAPH_TYPE_DEFAULT && moe_slots && moe_slots->has_vulkan_l1() &&
+                            !cparams.pipeline_parallel && loras->empty(),
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,

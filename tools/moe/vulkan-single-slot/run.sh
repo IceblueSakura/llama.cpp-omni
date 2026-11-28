@@ -1,23 +1,36 @@
 #!/usr/bin/env bash
-# Opt-in Linux/Vulkan correctness smoke for MiniCPM-V 4.7 35B Q4_K_M.
+# Opt-in Linux/Vulkan LES correctness smoke for MiniCPM-V 4.7 35B Q4_K_M.
 set -euo pipefail
 ulimit -c 0
-if (( $# < 3 || $# > 4 )); then
-    echo 'usage: bash run.sh BUILD_DIR NATIVE_GGUF LES_GGUF [smoke|smoke-no-eval|faults|bounded]' >&2
+usage() {
+    printf '%s\n' \
+        'usage: bash run.sh BUILD_DIR NATIVE_GGUF LES_GGUF [smoke|smoke-no-eval|faults|bounded]' \
+        '       bash run.sh BUILD_DIR LES_GGUF faults|bounded|pinned-staging|decode-l1' >&2
     exit 2
-fi
-mode=${4:-smoke}
-case "$mode" in
-    smoke|smoke-no-eval|faults|bounded) ;;
-    *) echo "unknown mode: $mode" >&2; exit 2 ;;
+}
+if (( $# < 3 || $# > 4 )); then usage; fi
+native=
+case "$3" in
+    faults|bounded|pinned-staging|decode-l1)
+        if (( $# != 3 )); then usage; fi
+        les=$(realpath -e -- "$2")
+        mode=$3
+        ;;
+    *)
+        mode=${4:-smoke}
+        case "$mode" in
+            smoke|smoke-no-eval|faults|bounded) ;;
+            *) echo "unknown mode: $mode" >&2; usage ;;
+        esac
+        native=$(realpath -e -- "$2")
+        les=$(realpath -e -- "$3")
+        ;;
 esac
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 bin=$(realpath -e -- "$1/bin")
-native=$(realpath -e -- "$2")
-les=$(realpath -e -- "$3")
-if [[ ! -r $bin/libllama.so || ! -f $native || ! -f $les ]]; then
-    echo 'a shared llama build and two GGUF files are required' >&2
+if [[ ! -r $bin/libllama.so || ! -f $les || ( -n $native && ! -f $native ) ]]; then
+    echo 'a shared llama build and the requested GGUF files are required' >&2
     exit 2
 fi
 mkdir -p "$root/build-les-d3-data"
@@ -31,6 +44,7 @@ export GGML_OP_OFFLOAD_MIN_BATCH=1
 export LLAMA_MOE_DECODE_WINDOW=0 LLAMA_MOE_LOOKAHEAD_PREFETCH=0 LLAMA_MOE_MATMUL_SPLIT=0 LLAMA_MOE_IO_THREADS=2
 export LLAMA_MOE_DUMMY_READ=0 LLAMA_MOE_SKIP_READ=0 LLAMA_MOE_PREWARM= LLAMA_MOE_LAYER_WINDOWS=
 unset GGML_VK_DISABLE_FUSION GGML_VK_DISABLE_COOPMAT2 GGML_VK_DISABLE_COOPMAT2_DECODE_VECTOR
+unset LLAMA_MOE_VK_PINNED_STAGING LLAMA_MOE_VK_L1_SLOTS LLAMA_MOE_VK_L1_TRACE
 c++ -std=c++17 -O2 -Wall -Wextra -I"$root/include" -I"$root/ggml/include" "$here/probe.cpp" \
     -L"$bin" -Wl,-rpath,"$bin" -lllama -lggml -lggml-base -lggml-cpu -ldl -o "$run_dir/probe"
 
@@ -39,7 +53,7 @@ run_probe() {
     local log=$run_dir/$name.log
     echo "=== $name ==="
     timeout 120 "$@" >"$log" 2>&1 || { tail -60 "$log"; return 1; }
-    grep -E 'storage: mode=|backend_uploaded=|Vulkan single slot:|^read_bytes_inference=|^step=|^fault=|^retry_rc=' "$log"
+    grep -E 'storage: mode=|backend_uploaded=|Vulkan (single slot|pinned staging|L1 summary)|^read_bytes_inference=|^step=|^fault=|^retry_rc=' "$log"
 }
 verify_stream() {
     local log=$1
@@ -49,6 +63,26 @@ verify_stream() {
 }
 
 case "$mode" in
+    pinned-staging|decode-l1)
+        run_probe staged "$run_dir/probe" "$les" 16 "$run_dir/staged.logits" off plain
+        case "$mode" in
+            pinned-staging)
+                opt=LLAMA_MOE_VK_PINNED_STAGING=1
+                active='Vulkan pinned staging: [1-9][0-9]*\.[0-9]+ MiB pinned'
+                ;;
+            decode-l1)
+                opt=LLAMA_MOE_VK_L1_SLOTS=32
+                active='Vulkan L1 summary .*payload=[1-9][0-9]*'
+                ;;
+        esac
+        run_probe "$mode" env "$opt" "$run_dir/probe" "$les" 16 "$run_dir/$mode.logits" off plain
+        if grep -Eq "$active" "$run_dir/staged.log" || ! grep -Eq "$active" "$run_dir/$mode.log"; then
+            echo "$mode did not activate only in the opt-in run" >&2
+            exit 1
+        fi
+        cmp "$run_dir/staged.logits" "$run_dir/$mode.logits"
+        echo "$mode/staged logits: byte identical"
+        ;;
     faults)
         cc -std=c11 -O2 -Wall -Wextra -shared -fPIC "$here/fault.c" -ldl -o "$run_dir/fault.so"
         for fault in fail abort prefill-fail; do
