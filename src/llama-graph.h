@@ -609,6 +609,7 @@ struct llm_graph_params {
     // 张量指针 —— 那就会拿 prefill 的共享张量去跑 decode（窗口失效但不报错）。
     // n_tokens 不足以区分：单 token 的 prefill 与 decode 都是 1。
     bool moe_decode_phase = false;
+    bool moe_single_slot = false;
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -700,6 +701,7 @@ struct llm_graph_params {
             loras == other.loras &&
             moe_slots == other.moe_slots &&
             moe_decode_phase == other.moe_decode_phase &&
+            moe_single_slot == other.moe_single_slot &&
             cross == other.cross;
     }
 };
@@ -838,6 +840,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     llama_moe_slot_runtime       * moe_slots;
     bool                           moe_decode_phase;
+    bool                           moe_single_slot;
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;

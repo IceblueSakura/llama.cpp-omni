@@ -1,5 +1,6 @@
 #include "llama-moe-slot.h"
 
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "llama-impl.h"
@@ -8,6 +9,7 @@
 #include "llama-moe-experts.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdarg>
 #include <cerrno>
@@ -20,9 +22,11 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -485,6 +489,174 @@ struct llama_moe_slot_runtime::impl {
         const llama_moe_experts_entry * entry = nullptr;
     };
 
+    // One graph per distinct expert layout; all graphs alias the same two
+    // Vulkan buffers. These graphs are executed synchronously, never together.
+    struct slot_plan {
+        ggml_context_ptr weight_ctx;
+        ggml_context_ptr graph_ctx;
+        std::array<ggml_tensor *, 3> slot = {};
+        ggml_tensor * input = nullptr;
+        ggml_tensor * local_id = nullptr;
+        ggml_tensor * route_weight = nullptr;
+        ggml_tensor * out = nullptr;
+        ggml_cgraph * graph = nullptr;
+
+        explicit slot_plan(const std::vector<binding> & bindings) {
+            weight_ctx.reset(ggml_init({3 * ggml_tensor_overhead(), nullptr, true}));
+            graph_ctx.reset(ggml_init({16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false), nullptr, true}));
+            if (!weight_ctx || !graph_ctx) {
+                throw std::runtime_error("cannot allocate single-slot metadata");
+            }
+            for (size_t i = 0; i < slot.size(); ++i) {
+                const auto * w = bindings[i].tensor;
+                slot[i] = ggml_new_tensor_3d(weight_ctx.get(), w->type, w->ne[0], w->ne[1], 1);
+                if (ggml_nbytes(slot[i]) != bindings[i].entry->bytes_per_expert) {
+                    throw std::runtime_error("single-slot expert stride mismatch");
+                }
+            }
+            input = ggml_new_tensor_3d(graph_ctx.get(), GGML_TYPE_F32, slot[0]->ne[0], 1, 1);
+            local_id = ggml_new_tensor_2d(graph_ctx.get(), GGML_TYPE_I32, 1, 1);
+            route_weight = ggml_new_tensor_1d(graph_ctx.get(), GGML_TYPE_F32, 1);
+            auto * gate = ggml_mul_mat_id(graph_ctx.get(), slot[0], input, local_id);
+            auto * up   = ggml_mul_mat_id(graph_ctx.get(), slot[1], input, local_id);
+            auto * act  = ggml_swiglu_split(graph_ctx.get(), gate, up);
+            auto * down = ggml_mul_mat_id(graph_ctx.get(), slot[2], act, local_id);
+            out = ggml_mul(graph_ctx.get(), down, route_weight);
+            graph = ggml_new_graph_custom(graph_ctx.get(), 32, false);
+            ggml_build_forward_expand(graph, out);
+        }
+
+        bool matches(const std::vector<binding> & bindings) const {
+            for (size_t i = 0; i < slot.size(); ++i) {
+                const auto * w = bindings[i].tensor;
+                if (slot[i]->type != w->type || slot[i]->ne[0] != w->ne[0] || slot[i]->ne[1] != w->ne[1]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    };
+
+    // A single demand read, never a queue. The caller drains it before
+    // leaving the layer, including when device work or the read fails.
+    struct single_slot_reader {
+        std::vector<uint8_t> packed;
+        std::mutex mutex;
+        std::condition_variable ready;
+        std::condition_variable done;
+        std::function<void()> task;
+        std::exception_ptr failure;
+        bool stop = false;
+        std::thread worker;
+
+        explicit single_slot_reader(size_t stride) : packed(stride), worker([this] {
+            std::unique_lock<std::mutex> lock(mutex);
+            while (true) {
+                ready.wait(lock, [&] { return stop || task; });
+                if (stop) {
+                    return;
+                }
+                lock.unlock();
+                std::exception_ptr error;
+                try {
+                    task();
+                } catch (...) {
+                    error = std::current_exception();
+                }
+                lock.lock();
+                failure = error;
+                task = nullptr;
+                done.notify_one();
+            }
+        }) {}
+
+        void submit(std::function<void()> read) {
+            std::lock_guard<std::mutex> lock(mutex);
+            GGML_ASSERT(!task && !failure);
+            task = std::move(read);
+            ready.notify_one();
+        }
+
+        std::exception_ptr drain() {
+            std::unique_lock<std::mutex> lock(mutex);
+            done.wait(lock, [&] { return !task; });
+            auto error = failure;
+            failure = nullptr;
+            return error;
+        }
+
+        ~single_slot_reader() {
+            drain();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                stop = true;
+            }
+            ready.notify_one();
+            worker.join();
+        }
+    };
+
+    struct single_slot {
+        std::vector<uint8_t> packed;
+        std::unique_ptr<single_slot_reader> reader;
+        std::vector<float> part;
+        std::vector<float> sum;
+        ggml_backend_ptr backend;
+        ggml_backend_buffer_ptr weight_buf;
+        ggml_backend_buffer_ptr graph_buf;
+        std::vector<slot_plan> plans;
+        std::vector<size_t> plan_by_layer;
+        uint64_t installs = 0;
+        uint64_t uploaded = 0;
+
+        size_t host_scratch_bytes() const {
+            return packed.capacity() + (reader ? reader->packed.capacity() : 0) +
+                (part.capacity() + sum.capacity()) * sizeof(float);
+        }
+
+        static void bind_buffer(ggml_context * ctx, ggml_backend_buffer_t buf) {
+            auto alloc = ggml_tallocr_new(buf);
+            for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                const auto status = t->view_src ? ggml_backend_view_init(t) : ggml_tallocr_alloc(&alloc, t);
+                if (status != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error("cannot bind shared Vulkan single-slot buffers");
+                }
+            }
+        }
+
+        void allocate(ggml_backend_dev_t dev, size_t stride, size_t width) {
+            packed.resize(stride);
+            part.resize(width);
+            sum.resize(width);
+            backend.reset(ggml_backend_dev_init(dev, nullptr));
+            if (!backend) {
+                throw std::runtime_error("cannot initialize Vulkan single-slot backend");
+            }
+            auto * buft = ggml_backend_get_default_buffer_type(backend.get());
+            size_t weight_bytes = 0;
+            size_t graph_bytes = 0;
+            for (const auto & p : plans) {
+                weight_bytes = std::max(weight_bytes, ggml_backend_alloc_ctx_tensors_from_buft_size(p.weight_ctx.get(), buft));
+                graph_bytes  = std::max(graph_bytes,  ggml_backend_alloc_ctx_tensors_from_buft_size(p.graph_ctx.get(), buft));
+            }
+            weight_buf.reset(ggml_backend_buft_alloc_buffer(buft, weight_bytes));
+            graph_buf.reset(ggml_backend_buft_alloc_buffer(buft, graph_bytes));
+            if (!weight_buf || !graph_buf) {
+                throw std::runtime_error("cannot allocate the Vulkan single-slot workspace");
+            }
+            ggml_backend_buffer_set_usage(weight_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            for (const auto & p : plans) {
+                bind_buffer(p.weight_ctx.get(), weight_buf.get());
+                bind_buffer(p.graph_ctx.get(), graph_buf.get());
+                for (int i = 0; i < ggml_graph_n_nodes(p.graph); ++i) {
+                    if (!ggml_backend_supports_op(backend.get(), ggml_graph_node(p.graph, i))) {
+                        throw std::runtime_error("Vulkan does not support the single-slot graph");
+                    }
+                }
+            }
+        }
+    };
+
     // 一次读取要用的「打包视图」：prefill 和 decode 各有自己的一套张量与文件布局。
     // 抽出来是为了让 read_expert_directv 能按阶段选，不用复制读取逻辑。
     struct pack_view {
@@ -660,6 +832,7 @@ struct llama_moe_slot_runtime::impl {
     std::exception_ptr compute_error;
     std::atomic<bool> compute_failed{false};
     int32_t compute_tokens = 0;
+    std::unique_ptr<single_slot> stream;
 
     void capture_failure() noexcept {
         compute_error = std::current_exception();
@@ -667,7 +840,7 @@ struct llama_moe_slot_runtime::impl {
     }
 
     explicit impl(const llama_model & model, std::function<void(int, int)> before_prefetch,
-                  std::function<void()> before_wait) :
+                  std::function<void()> before_wait, bool allow_single_slot) :
         predicted(model.layers.size()),
         miss_per_layer(model.layers.size(), 0),
         deferred(model.layers.size()),
@@ -679,6 +852,9 @@ struct llama_moe_slot_runtime::impl {
         userdata(model.layers.size()),
         userdata_deferred(model.layers.size()) {
         this->before_wait = std::move(before_wait);
+        if (allow_single_slot && init_single_slot()) {
+            return;
+        }
         for (size_t il = 0; il < model.layers.size(); ++il) {
             auto & state = layers[il];
             const auto & layer = model.layers[il];
@@ -856,6 +1032,174 @@ struct llama_moe_slot_runtime::impl {
         }
         sweep_init();
         prewarm_init();
+    }
+
+    bool init_single_slot() {
+        const char * env = std::getenv("LLAMA_MOE_VK_SINGLE_SLOT");
+        if (!env || std::strcmp(env, "1") != 0) {
+            return false;
+        }
+        try {
+            if (model.arch != LLM_ARCH_QWEN35MOE || model.hparams.no_alloc || layers.empty() ||
+                    model.hparams.n_expert_used != 8 || model.moe_decode_window() != 0) {
+                throw std::runtime_error("requires packed top-8 qwen35moe with the decode window disabled");
+            }
+            const char * prefetch = std::getenv("LLAMA_MOE_LOOKAHEAD_PREFETCH");
+            const char * split = std::getenv("LLAMA_MOE_MATMUL_SPLIT");
+            if ((prefetch && *prefetch && *prefetch != '0') || (split && std::atoi(split) > 0)) {
+                throw std::runtime_error("Vulkan single slot requires prefetch and matmul split disabled");
+            }
+            auto * dev = model.dev_layer(0);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                    std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "Vulkan") != 0 ||
+                    ggml_backend_buft_is_host_addressable(ggml_backend_dev_buffer_type(dev))) {
+                throw std::runtime_error("requires a discrete Vulkan device");
+            }
+            auto s = std::make_unique<single_slot>();
+            // Do not touch the legacy bank. Use the model's unbacked tensor
+            // templates for layout and commit only after every layer passes.
+            std::vector<layer_state> packed_layers(layers.size());
+            size_t max_stride = 0;
+            size_t max_width = 0;
+            for (size_t il = 0; il < layers.size(); ++il) {
+                auto & st = packed_layers[il];
+                const auto & l = model.layers[il];
+                if (model.dev_layer(il) != dev || l.ffn_gate_up_exps ||
+                        l.ffn_gate_exps_s || l.ffn_up_exps_s || l.ffn_down_exps_s ||
+                        !l.ffn_gate_exps || !l.ffn_up_exps || !l.ffn_down_exps) {
+                    throw std::runtime_error(format("layer %zu requires packed and unscaled gate/up/down on the same device", il));
+                }
+                for (auto * t : {l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps}) {
+                    auto b = describe_binding(t, n_slots);
+                    if (b.entry->layer != (int32_t) il) {
+                        throw std::runtime_error("single-slot binding references the wrong layer");
+                    }
+                    st.bindings.push_back(b);
+                }
+                finalize_pack(st);
+                if (!st.pack_ok) {
+                    throw std::runtime_error("single-slot layout is not packed");
+                }
+                // finalize_pack permits gaps; this experiment reads one complete span.
+                size_t packed = 0;
+                for (const auto i : st.pack_order) {
+                    const auto & e = *st.bindings[i].entry;
+                    if (e.offset != st.pack_base + packed) {
+                        throw std::runtime_error("single-slot families are not contiguous");
+                    }
+                    packed += e.bytes_per_expert;
+                }
+                if (packed != st.pack_stride) {
+                    throw std::runtime_error("single-slot families do not cover the expert");
+                }
+                size_t plan = 0;
+                while (plan < s->plans.size() && !s->plans[plan].matches(st.bindings)) {
+                    ++plan;
+                }
+                if (plan == s->plans.size()) {
+                    s->plans.emplace_back(st.bindings);
+                    const auto & w = s->plans.back().slot;
+                    moe_log("Vulkan single slot layout %zu: first layer=%zu types=%s/%s/%s payload=%zu",
+                            plan, il, ggml_type_name(w[0]->type), ggml_type_name(w[1]->type), ggml_type_name(w[2]->type), packed);
+                }
+                s->plan_by_layer.push_back(plan);
+                st.enabled = true;
+                max_stride = std::max(max_stride, packed);
+                max_width = std::max(max_width, (size_t) st.bindings[0].tensor->ne[0]);
+            }
+            s->allocate(dev, max_stride, max_width);
+            const char * pipeline = std::getenv("LLAMA_MOE_VK_SINGLE_SLOT_READ_AHEAD");
+            if (pipeline && std::strcmp(pipeline, "1") == 0) {
+                try {
+                    s->reader = std::make_unique<single_slot_reader>(max_stride);
+                } catch (const std::bad_alloc &) {
+                    moe_log("Vulkan single slot: read-ahead buffer unavailable; using synchronous reads");
+                } catch (const std::system_error & e) {
+                    moe_log("Vulkan single slot: read-ahead worker unavailable (%s); using synchronous reads", e.what());
+                }
+            }
+            for (size_t il = 0; il < layers.size(); ++il) {
+                userdata[il] = { nullptr, (int) il };
+            }
+            layers.swap(packed_layers);
+            moe_log("storage: mode=vulkan-single-slot bank=%.2f MiB", storage.size_bytes() / 1048576.0);
+            moe_log("Vulkan single slot: layers=%zu layouts=%zu host_expert=%zu host_scratch=%zu device=%zu workspace=%zu",
+                    layers.size(), s->plans.size(), max_stride, s->host_scratch_bytes(), ggml_backend_buffer_get_size(s->weight_buf.get()),
+                    ggml_backend_buffer_get_size(s->graph_buf.get()));
+            stream = std::move(s);
+            return true;
+        } catch (const std::exception & e) {
+            moe_log("Vulkan single slot disabled: %s", e.what());
+            return false;
+        }
+    }
+
+    void run_single_slot(int il, ggml_tensor * dst, const ggml_tensor * input, const ggml_tensor * ids, const ggml_tensor * weights) {
+        auto & s = *stream;
+        const auto & st = layers[il];
+        const auto & p = s.plans[s.plan_by_layer[il]];
+        const size_t width = p.input->ne[0];
+        const size_t bytes = ggml_nbytes(p.input);
+        GGML_ASSERT(input->type == GGML_TYPE_F32 && input->ne[0] == (int64_t) width && input->ne[1] == 1);
+        GGML_ASSERT(ggml_nbytes(input) == bytes && ggml_nbytes(dst) == bytes);
+        GGML_ASSERT(ids->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(ids) == 8 && ggml_nelements(weights) == 8);
+        GGML_ASSERT(ggml_is_contiguous(input) && ggml_is_contiguous(ids) && ggml_is_contiguous(weights));
+        const auto * id = static_cast<const int32_t *>(ids->data);
+        const auto * w = static_cast<const float *>(weights->data);
+        const int32_t zero = 0;
+        ggml_backend_tensor_set(p.local_id, &zero, 0, sizeof(zero));
+        ggml_backend_tensor_set(p.input, input->data, 0, bytes);
+        for (int i = 0; i < 8; ++i) {
+            if (id[i] < 0 || id[i] >= n_expert) {
+                throw std::runtime_error("single-slot expert ID out of range");
+            }
+        }
+        const int fd = fd_for(st.pack_path);
+        const auto read = [this, fd, &st](int32_t expert, uint8_t * packed) {
+            iovec iov{packed, st.pack_stride};
+            readv_span(fd, st.pack_base + size_t(expert) * st.pack_stride, &iov, 1);
+        };
+        uint8_t * current = s.packed.data();
+        uint8_t * next = s.reader ? s.reader->packed.data() : nullptr;
+        try {
+            for (int i = 0; i < 8; ++i) {
+                if (!s.reader || i == 0) {
+                    read(id[i], current);
+                } else if (auto error = s.reader->drain()) {
+                    std::rethrow_exception(error);
+                }
+                if (s.reader && i + 1 < 8) {
+                    // Only the alternate host buffer is writable by the worker.
+                    s.reader->submit([read, expert = id[i + 1], next] { read(expert, next); });
+                }
+                for (size_t f = 0; f < p.slot.size(); ++f) {
+                    const auto & e = *st.bindings[f].entry;
+                    ggml_backend_tensor_set(p.slot[f], current + (e.offset - st.pack_base), 0, e.bytes_per_expert);
+                }
+                s.uploaded += st.pack_stride;
+                ggml_backend_tensor_set(p.route_weight, w + i, 0, sizeof(float));
+                // Synchronous compute drains the down projection before slot reuse.
+                if (ggml_backend_graph_compute(s.backend.get(), p.graph) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error("Vulkan single-slot expert compute failed");
+                }
+                ggml_backend_tensor_get(p.out, s.part.data(), 0, bytes);
+                ++s.installs;
+                for (size_t j = 0; j < width; ++j) {
+                    s.sum[j] = i == 0 ? s.part[j] : s.sum[j] + s.part[j];
+                }
+                if (s.reader) {
+                    std::swap(current, next);
+                }
+            }
+        } catch (...) {
+            if (s.reader) {
+                s.reader->drain();
+            }
+            throw;
+        }
+        // The CPU abort path stops consumers if any expert failed.
+        std::memcpy(dst->data, s.sum.data(), bytes);
     }
 
     /// 预读专用：把一个 expert 读进**目标层自己的窗口**（按窗口 LRU 挑 slot）。
@@ -1313,6 +1657,10 @@ struct llama_moe_slot_runtime::impl {
     }
 
     ~impl() {
+        if (stream) {
+            moe_log("Vulkan single slot: installs=%llu payload_uploaded=%.2f MiB",
+                    (unsigned long long) stream->installs, stream->uploaded / 1048576.0);
+        }
         moe_log("storage: host/shared=%.2f MiB backend_uploaded=%.2f MiB",
             storage.size_bytes() / 1048576.0, storage.uploaded_bytes() / 1048576.0);
         if (cur.n_layers > 0) {
@@ -1355,11 +1703,7 @@ struct llama_moe_slot_runtime::impl {
         }
     }
 
-    void bind(layer_state & state, ggml_tensor * tensor, int32_t expect_slots,
-              std::vector<binding> * out = nullptr) {
-        if (!tensor) {
-            return;
-        }
+    binding describe_binding(ggml_tensor * tensor, int32_t expect_slots) const {
         const auto * entry = model.moe_experts_entry(ggml_get_name(tensor));
         if (!entry) {
             throw std::runtime_error(format("missing experts entry for tensor '%s'", ggml_get_name(tensor)));
@@ -1368,6 +1712,15 @@ struct llama_moe_slot_runtime::impl {
             ggml_nbytes(tensor) != entry->bytes_per_expert * (size_t) expect_slots) {
             throw std::runtime_error(format("invalid virtual slot tensor '%s'", ggml_get_name(tensor)));
         }
+        return { tensor, entry };
+    }
+
+    void bind(layer_state & state, ggml_tensor * tensor, int32_t expect_slots,
+               std::vector<binding> * out = nullptr) {
+        if (!tensor) {
+            return;
+        }
+        const auto * entry = describe_binding(tensor, expect_slots).entry;
         auto * dev = model.dev_layer(entry->layer);
         auto * buft = ggml_backend_dev_buffer_type(dev);
         auto * reg = ggml_backend_dev_backend_reg(dev);
@@ -1502,6 +1855,18 @@ struct llama_moe_slot_runtime::impl {
         if (fd < 0) {
             throw std::runtime_error(format("failed to open MoE experts file '%s': %s", path.c_str(), std::strerror(errno)));
         }
+#if defined(__linux__) && defined(POSIX_FADV_RANDOM)
+        const char * advice = stream ? std::getenv("LLAMA_MOE_VK_SINGLE_SLOT_FADV_RANDOM") : nullptr;
+        if (advice && std::strcmp(advice, "1") == 0) {
+            // Disable kernel readahead on this descriptor, not the bounded demand-read worker.
+            const int rc = posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+            if (rc == 0) {
+                moe_log("Vulkan single slot: POSIX_FADV_RANDOM enabled on expert fd");
+            } else {
+                moe_log("Vulkan single slot: POSIX_FADV_RANDOM failed: %s", std::strerror(rc));
+            }
+        }
+#endif
         fds.emplace(path, fd);
         return fd;
     }
@@ -2272,7 +2637,7 @@ struct llama_moe_slot_runtime::impl {
     }
 
     void park_expert_memory() {
-        if (!park_window_enabled()) {
+        if (stream || !park_window_enabled()) {
             return;
         }
         lookahead.drain();
@@ -2363,8 +2728,8 @@ void llama_moe_slot_runtime::map_custom_lookahead(
 }
 
 llama_moe_slot_runtime::llama_moe_slot_runtime(const llama_model & model,
-        std::function<void(int, int)> before_prefetch, std::function<void()> before_wait) :
-    pimpl(std::make_unique<impl>(model, std::move(before_prefetch), std::move(before_wait))) {
+        std::function<void(int, int)> before_prefetch, std::function<void()> before_wait, bool allow_single_slot) :
+    pimpl(std::make_unique<impl>(model, std::move(before_prefetch), std::move(before_wait), allow_single_slot)) {
     for (auto & item : pimpl->userdata) {
         item.runtime = this;
     }
@@ -2407,7 +2772,7 @@ bool llama_moe_slot_runtime::copy_weights(ggml_backend_t backend, const ggml_ten
 }
 
 uint64_t llama_moe_slot_runtime::uploaded_bytes() const {
-    return pimpl->storage.uploaded_bytes();
+    return pimpl->storage.uploaded_bytes() + (pimpl->stream ? pimpl->stream->uploaded : 0);
 }
 
 bool llama_moe_slot_runtime::failed() const {
@@ -2441,11 +2806,36 @@ void llama_moe_slot_runtime::cancel_compute() {
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_slot_runtime::memory_breakdown() const {
-    auto sizes = pimpl->storage.memory_breakdown();
+    auto result = pimpl->storage.memory_breakdown();
     if (pimpl->pred_buft && pimpl->pred_bytes > 0) {
-        sizes[pimpl->pred_buft] += pimpl->pred_bytes;
+        result[pimpl->pred_buft] += pimpl->pred_bytes;
     }
-    return sizes;
+    if (const auto & s = pimpl->stream) {
+        result[ggml_backend_cpu_buffer_type()] += s->host_scratch_bytes();
+        for (auto * buf : {s->weight_buf.get(), s->graph_buf.get()}) {
+            result[ggml_backend_buffer_get_type(buf)] += ggml_backend_buffer_get_size(buf);
+        }
+    }
+    return result;
+}
+
+bool llama_moe_slot_runtime::has_single_slot() const {
+    return pimpl->stream != nullptr;
+}
+
+ggml_tensor * llama_moe_slot_runtime::build_single_slot(ggml_context * ctx, ggml_tensor * input,
+                                                       ggml_tensor * expert_ids, ggml_tensor * weights, int layer) {
+    return ggml_map_custom3(ctx, input, expert_ids, weights,
+        [](ggml_tensor * dst, const ggml_tensor * x, const ggml_tensor * ids, const ggml_tensor * w,
+           int, int, void * ud) {
+            const auto & data = *static_cast<const impl::map_userdata *>(ud);
+            auto & p = *data.runtime->pimpl;
+            try {
+                p.run_single_slot(data.layer, dst, x, ids, w);
+            } catch (...) {
+                p.capture_failure();
+            }
+        }, 1, &pimpl->userdata[layer]);
 }
 
 bool llama_moe_slot_runtime::uses_layer(int layer) const {
@@ -2526,7 +2916,7 @@ llama_moe_slot_runtime::counters llama_moe_slot_runtime::counters_snapshot() con
 }
 
 void llama_moe_slot_runtime::set_lookahead_prefetch_depth(int depth) {
-    if (depth > 0 && pimpl->storage.requires_upload()) {
+    if (depth > 0 && (pimpl->stream || pimpl->storage.requires_upload())) {
         throw std::runtime_error("lookahead uploads are not yet supported by staged LES");
     }
     pimpl->lookahead.set_depth(depth);

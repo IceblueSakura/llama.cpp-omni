@@ -15,7 +15,8 @@ public:
     // Observe a worker before it claims storage, without replacing its real I/O.
     explicit llama_moe_slot_runtime(const llama_model & model,
         std::function<void(int, int)> before_prefetch = {},
-        std::function<void()> before_wait = {});
+        std::function<void()> before_wait = {},
+        bool allow_single_slot = false);
     ~llama_moe_slot_runtime();
 
     bool uses_layer(int layer) const;
@@ -32,6 +33,9 @@ public:
     // Caller must first synchronize submitted backend work.
     void cancel_compute();
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+    bool has_single_slot() const;
+    ggml_tensor * build_single_slot(ggml_context * ctx, ggml_tensor * input,
+                                   ggml_tensor * expert_ids, ggml_tensor * weights, int layer);
     bool lookahead_prefetch_enabled() const;
     int  lookahead_prefetch_depth() const;
     /// 每层 decode 窗口宽度（slot 数）。0 = 未启用按层窗口。

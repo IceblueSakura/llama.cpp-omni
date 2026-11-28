@@ -1078,6 +1078,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     moe_slots        (params.moe_slots),
     moe_decode_phase (params.moe_decode_phase),
+     moe_single_slot  (params.moe_single_slot),
     cross            (params.cross),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -1501,7 +1502,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s) const {
-    if (moe_slots && moe_slots->uses_layer(il)) {
+    if (moe_slots && !moe_single_slot && moe_slots->uses_layer(il)) {
         gate_up_exps = moe_slots->bank_tensor(gate_up_exps, moe_decode_phase);
         gate_exps    = moe_slots->bank_tensor(gate_exps, moe_decode_phase);
         up_exps      = moe_slots->bank_tensor(up_exps, moe_decode_phase);
@@ -1639,6 +1640,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    if (moe_single_slot) {
+        // Admission skipped the legacy bank entirely; do not fall back here.
+        GGML_ASSERT(n_expert_used == 8 && type_op == LLM_FFN_SILU && !weight_before_ffn &&
+            gate_exps && up_exps && down_exps && !gate_up_exps && !gate_exps_b &&
+            !up_exps_b && !down_exps_b && !gate_up_exps_b && !gate_exps_s && !up_exps_s && !down_exps_s);
+        auto * out = moe_slots->build_single_slot(ctx0,
+            ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur),
+            ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts),
+            ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights), il);
+        ggml_backend_sched_set_tensor_backend(sched, out, backend_cpu);
+        cb(out, "ffn_moe_out", il);
+        return out;
+    }
 
     const bool split_moe = moe_decode_phase &&
         moe_slots && moe_slots->uses_layer(il) && moe_slots->matmul_split() > 0 &&

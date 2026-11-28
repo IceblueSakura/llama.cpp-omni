@@ -125,7 +125,7 @@ struct llama_context {
     void set_n_expert_used(int32_t n);
     int32_t n_expert_used() const;
 
-    void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+    int32_t set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -286,6 +286,7 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
     std::unique_ptr<llama_moe_slot_runtime> moe_slots;
+    bool moe_single_slot_context_invalid = false;
     ggml_backend_sched_ptr sched;
 
     llama_cparams cparams;

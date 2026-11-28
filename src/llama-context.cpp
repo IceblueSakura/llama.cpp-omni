@@ -410,8 +410,15 @@ llama_context::llama_context(
         }
 
         if (model.moe_slot_bank_enabled()) {
-            moe_slots = std::make_unique<llama_moe_slot_runtime>(model);
+            moe_slots = std::make_unique<llama_moe_slot_runtime>(model, nullptr, nullptr,
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT);
             set_abort_callback(abort_callback, abort_callback_data);
+            if (moe_slots->has_single_slot() && cparams.n_ubatch > 1) {
+                // Row-wise experts matched the one-row Vulkan path. A wider
+                // prefill uses a different matmul path and has not passed the oracle.
+                LLAMA_LOG_INFO("%s: Vulkan single slot caps n_ubatch at 1 (requested %u)\n", __func__, cparams.n_ubatch);
+                cparams.n_ubatch = 1;
+            }
         }
         sched_reserve();
 
@@ -1219,6 +1226,10 @@ void llama_context::set_moe_lookahead_prefetch_depth(int32_t depth) {
     if (!moe_slots) {
         return;
     }
+    if (moe_slots->has_single_slot() && depth > 0) {
+        LLAMA_LOG_WARN("%s: Vulkan single-slot streaming does not support lookahead\n", __func__);
+        return;
+    }
     if (depth < 0) {
         depth = 0;
     }
@@ -1256,6 +1267,10 @@ void llama_context::prewarm_moe_experts() {
 
 void llama_context::set_n_expert_used(int32_t n) {
     const int32_t n_max = (int32_t) model.hparams.n_expert_used;
+    if (moe_slots && moe_slots->has_single_slot() && n > 0 && n < n_max) {
+        LLAMA_LOG_WARN("%s: Vulkan single slot requires the model's full top-%d\n", __func__, n_max);
+        return;
+    }
     if (n < 0) {
         n = 0;
     }
@@ -1336,11 +1351,15 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     return true;
 }
 
-void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
+int32_t llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
     if (adapters_lora_are_same(adapters, n_adapters, scales)) {
-        return;
+        return 0;
+    }
+    if (moe_slots && moe_slots->has_single_slot()) {
+        LLAMA_LOG_ERROR("%s: LoRA requires a context without Vulkan single-slot streaming\n", __func__);
+        return -1;
     }
 
     loras.reset(new llama_adapter_loras());
@@ -1352,6 +1371,7 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
     }
 
     sched_need_reserve = true;
+    return 0;
 }
 
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -1551,6 +1571,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    if (moe_slots && moe_slots->has_single_slot()) {
+        LLAMA_LOG_ERROR("%s: Vulkan single-slot streaming is only available through decode\n", __func__);
+        return -1;
+    }
     // MTP hook batches carry both token (next-token id) and embd (h_pre_norm row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1859,6 +1883,10 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (moe_single_slot_context_invalid) {
+        LLAMA_LOG_ERROR("%s: recreate context after an interrupted Vulkan single-slot graph\n", __func__);
+        return -3;
+    }
     // MTP hook batches carry both token (next-token id) and embd (h_pre_norm row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2044,6 +2072,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
 
                 memory->seq_rm(s, pos_min[s], -1);
+            }
+
+            if (moe_slots && moe_slots->has_single_slot()) {
+                // seq_rm success does not guarantee a replayable recurrent
+                // state after an interrupted graph, even at prompt position 0.
+                moe_single_slot_context_invalid = true;
+                LLAMA_LOG_ERROR("%s: interrupted Vulkan single-slot graph invalidated the context\n", __func__);
             }
 
             switch (status) {
@@ -2612,6 +2647,8 @@ llm_graph_params llama_context::graph_params(
         // 所以用运行期解析出来的同一个 window_max_rows。
         /*.moe_decode_phase =*/ moe_slots != nullptr && moe_slots->decode_window() > 0 &&
                                 ubatch.n_tokens <= moe_slots->window_max_rows(),
+        // Use the same expert workspace in reservation, prefill and decode.
+        /*.moe_single_slot =*/ gtype == LLM_GRAPH_TYPE_DEFAULT && moe_slots && moe_slots->has_single_slot(),
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -4072,9 +4109,7 @@ int32_t llama_set_adapters_lora(
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
     }
 
-    ctx->set_adapters_lora(adapters, n_adapters, scales);
-
-    return 0;
+    return ctx->set_adapters_lora(adapters, n_adapters, scales);
 }
 
 int32_t llama_set_adapter_cvec(
