@@ -98,6 +98,35 @@ static bool park_window_enabled() {
     return e[0] != '0';
 }
 
+static ggml_backend_buffer_type_t vulkan_pinned_staging_type(const llama_model & model) {
+    const char * env = std::getenv("LLAMA_MOE_VK_PINNED_STAGING");
+    if (!env || std::strcmp(env, "1") != 0) {
+        return nullptr;
+    }
+    const char * single_slot = std::getenv("LLAMA_MOE_VK_SINGLE_SLOT");
+    if ((single_slot && std::strcmp(single_slot, "1") == 0) || model.hparams.no_alloc ||
+            model.moe_decode_window() != 0 || model.devices.size() != 1 || model.devices.front().is_meta) {
+        return nullptr;
+    }
+    auto * dev = model.devices.front().dev;
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU || !reg ||
+            std::strcmp(ggml_backend_reg_name(reg), "Vulkan") != 0 ||
+            ggml_backend_buft_is_host_addressable(ggml_backend_dev_buffer_type(dev))) {
+        return nullptr;
+    }
+    for (size_t il = 0; il < model.layers.size(); ++il) {
+        if (model.layers[il].ffn_down_exps && model.dev_layer(il) != dev) {
+            return nullptr;
+        }
+    }
+    auto * host = ggml_backend_dev_host_buffer_type(dev);
+    // Vulkan currently exposes its pinned allocator for the first device only.
+    // An allocation must be registered on the same device that submits the copy.
+    return host && ggml_backend_buft_get_device(host) == dev && ggml_backend_buft_is_host_addressable(host)
+        ? host : nullptr;
+}
+
 using metal_buf_fn = bool (*)(ggml_backend_buffer_t);
 
 static metal_buf_fn lookup_metal_buf_fn(ggml_backend_buffer_t buf, const char * name) {
@@ -845,7 +874,7 @@ struct llama_moe_slot_runtime::impl {
         miss_per_layer(model.layers.size(), 0),
         deferred(model.layers.size()),
         model(model),
-        storage(16 * model.layers.size() + 64, model.hparams.no_alloc),
+        storage(16 * model.layers.size() + 64, model.hparams.no_alloc, vulkan_pinned_staging_type(model)),
         n_expert((int32_t) model.hparams.n_expert),
         n_slots(model.moe_slot_bank_size()),
         layers(model.layers.size()),
@@ -931,6 +960,11 @@ struct llama_moe_slot_runtime::impl {
         moe_log("storage: mode=%s bank=%.2f MiB",
             storage.requires_upload() ? "host-staged-sync" : "host/shared-direct",
             storage.size_bytes() / 1048576.0);
+        if (storage.pinned_staging_enabled()) {
+            const size_t pinned = storage.pinned_bytes();
+            moe_log("Vulkan pinned staging: %.2f MiB pinned, %.2f MiB CPU fallback",
+                    pinned / 1048576.0, (storage.size_bytes() - pinned) / 1048576.0);
+        }
 
         // Staged backends have a single synchronous installation boundary in G1.
         // A2 rewrites the same source after its scheduler copy; lookahead needs

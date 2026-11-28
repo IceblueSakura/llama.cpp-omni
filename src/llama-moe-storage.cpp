@@ -4,7 +4,8 @@
 #include <cstring>
 #include <stdexcept>
 
-llama_moe_storage::llama_moe_storage(size_t n_tensors, bool no_alloc) : no_alloc(no_alloc) {
+llama_moe_storage::llama_moe_storage(size_t n_tensors, bool no_alloc, ggml_backend_buffer_type_t pinned_staging)
+    : no_alloc(no_alloc), pinned_staging(no_alloc ? nullptr : pinned_staging) {
     ctx.reset(ggml_init({ggml_tensor_overhead() * n_tensors, nullptr, true}));
     if (!ctx) {
         throw std::runtime_error("failed to create LES storage metadata");
@@ -15,11 +16,11 @@ ggml_tensor * llama_moe_storage::clone(const ggml_tensor * tensor, ggml_backend_
     if (!tensor) {
         return nullptr;
     }
-    // Resolve the storage type before deduplicating shared roots: CPU layers and
-    // Metal shared layers must not accidentally alias a CPU-only allocation.
+    // Resolve the storage type before deduplicating shared roots. A pinned
+    // staging root keeps its own identity even when its allocation falls back.
     if (!ggml_backend_buft_is_host_addressable(buft)) {
         staged = true;
-        buft = ggml_backend_cpu_buffer_type();
+        buft = pinned_staging ? pinned_staging : ggml_backend_cpu_buffer_type();
     }
     auto & by_type = clones[buft];
     const auto it = by_type.find(tensor);
@@ -42,7 +43,14 @@ ggml_tensor * llama_moe_storage::clone(const ggml_tensor * tensor, ggml_backend_
         // A device address is not a preadv destination. The selected host/shared
         // allocation is bounded by the template geometry, never by model size.
         const size_t size = ggml_backend_buft_get_alloc_size(buft, result);
-        ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer(buft, no_alloc ? 0 : size));
+        ggml_backend_buffer_ptr buffer;
+        if (buft != pinned_staging || size <= ggml_backend_buft_get_max_size(buft)) {
+            buffer.reset(ggml_backend_buft_alloc_buffer(buft, no_alloc ? 0 : size));
+        }
+        if (!buffer && buft == pinned_staging) {
+            auto * cpu = ggml_backend_cpu_buffer_type();
+            buffer.reset(ggml_backend_buft_alloc_buffer(cpu, ggml_backend_buft_get_alloc_size(cpu, result)));
+        }
         if (!buffer) {
             throw std::runtime_error("failed to allocate LES bank");
         }
@@ -57,7 +65,12 @@ ggml_tensor * llama_moe_storage::clone(const ggml_tensor * tensor, ggml_backend_
         if (!no_alloc) {
             ggml_backend_buffer_clear(buffer.get(), 0);
         }
-        sizes[buft] += size;
+        if (buft == pinned_staging) {
+            auto * actual_buft = ggml_backend_buffer_get_type(buffer.get());
+            sizes[actual_buft] += ggml_backend_buft_get_alloc_size(actual_buft, result);
+        } else {
+            sizes[buft] += size;
+        }
         buffers.push_back(std::move(buffer));
     }
     tensors.emplace(tensor, result);
@@ -81,6 +94,11 @@ size_t llama_moe_storage::size_bytes() const {
         size += item.second;
     }
     return size;
+}
+
+size_t llama_moe_storage::pinned_bytes() const {
+    const auto it = sizes.find(pinned_staging);
+    return it == sizes.end() ? 0 : it->second;
 }
 
 bool llama_moe_storage::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {

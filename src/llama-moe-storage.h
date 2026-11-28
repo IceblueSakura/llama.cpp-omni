@@ -13,7 +13,8 @@
 // backends read directly into these banks; other backends consume scheduler copies.
 class llama_moe_storage {
 public:
-    explicit llama_moe_storage(size_t n_tensors, bool no_alloc = false);
+    explicit llama_moe_storage(size_t n_tensors, bool no_alloc = false,
+                               ggml_backend_buffer_type_t pinned_staging = nullptr);
     ggml_tensor * clone(const ggml_tensor * tensor, ggml_backend_buffer_type_t buft);
     ggml_tensor * get(const ggml_tensor * tensor) const;
     bool owns(const ggml_tensor * tensor) const;
@@ -23,6 +24,8 @@ public:
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
     uint64_t uploaded_bytes() const { return n_uploaded; }
     bool requires_upload() const { return staged; }
+    bool pinned_staging_enabled() const { return pinned_staging != nullptr; }
+    size_t pinned_bytes() const;
     size_t size_bytes() const;
     const std::map<ggml_backend_buffer_type_t, size_t> & memory_breakdown() const { return sizes; }
 
@@ -36,5 +39,6 @@ private:
     uint64_t n_uploaded = 0;
     bool no_alloc;
     bool staged = false;
+    ggml_backend_buffer_type_t pinned_staging;
     std::map<ggml_backend_buffer_type_t, size_t> sizes;
 };
