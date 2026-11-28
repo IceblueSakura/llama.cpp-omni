@@ -4,6 +4,8 @@ find_library(METALKIT_FRAMEWORK MetalKit   REQUIRED)
 
 message(STATUS "Metal framework found")
 
+option(GGML_METAL_TESTING "Build private Metal allocator fault-injection tests" OFF)
+
 ggml_add_backend_library(ggml-metal
                          ggml-metal.cpp
                          ggml-metal-device.m
@@ -21,6 +23,10 @@ target_link_libraries(ggml-metal PRIVATE
 
 if (GGML_METAL_NDEBUG)
     add_compile_definitions(GGML_METAL_NDEBUG)
+endif()
+
+if (GGML_METAL_TESTING)
+    target_compile_definitions(ggml-metal PRIVATE GGML_METAL_TESTING)
 endif()
 
 set(METALLIB_COMMON "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-common.h")

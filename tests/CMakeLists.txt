@@ -119,6 +119,84 @@ endfunction()
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
+if (APPLE AND GGML_METAL_TESTING AND TARGET ggml-metal)
+    if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
+        message(FATAL_ERROR "GGML_METAL_TESTING requires BUILD_SHARED_LIBS=OFF and GGML_BACKEND_DL=OFF")
+    endif()
+    llama_build_and_test(test-metal-alloc.cpp)
+    target_link_libraries(test-metal-alloc PRIVATE ggml-metal)
+    target_include_directories(test-metal-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+    target_compile_definitions(test-metal-alloc PRIVATE GGML_METAL_TESTING)
+    set_tests_properties(test-metal-alloc PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+# Internal LES APIs are not exported from Windows shared libraries.
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    set(LES_TEST_ENV
+        "LLAMA_MOE_PREFETCH_READ=1;LLAMA_MOE_PREFETCH_UNIFIED=1;LLAMA_MOE_WINDOW_MAX_ROWS=1;LLAMA_MOE_DUMMY_READ=0;LLAMA_MOE_SKIP_READ=0;LLAMA_MOE_READ_DELAY_US=0;LLAMA_MOE_PREWARM=;LLAMA_MOE_LAYER_WINDOWS=")
+    llama_build(test-les.cpp)
+    target_include_directories(test-les PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/vendor ${PROJECT_SOURCE_DIR}/ggml/src)
+    if (GGML_VULKAN_CHECK_RESULTS OR GGML_VULKAN_RUN_TESTS)
+        target_compile_definitions(test-les PRIVATE TEST_LES_VULKAN_SYNCHRONOUS)
+    endif()
+    llama_test(test-les NAME test-les-cpu-packed ARGS --case cpu-packed --backend CPU)
+    llama_test(test-les NAME test-les-quantizer ARGS --case quantizer --backend CPU)
+    llama_test(test-les NAME test-les-quantizer-inputs ARGS --case quantizer-inputs --backend CPU)
+    set_tests_properties(test-les-quantizer test-les-quantizer-inputs PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=2;LLAMA_MOE_LOOKAHEAD_PREFETCH=0;LLAMA_MOE_MATMUL_SPLIT=0")
+    llama_test(test-les NAME test-les-invalid-layout ARGS --case invalid-layout --backend CPU)
+    llama_test(test-les NAME test-les-carrier-bounds ARGS --case carrier-bounds --backend CPU)
+    llama_test(test-les NAME test-les-layout-metadata ARGS --case layout-metadata --backend CPU)
+    llama_test(test-les NAME test-les-tiny-no-alloc ARGS --case tiny-no-alloc --backend CPU)
+    set_tests_properties(test-les-carrier-bounds test-les-tiny-no-alloc PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=2;LLAMA_MOE_LOOKAHEAD_PREFETCH=0;LLAMA_MOE_MATMUL_SPLIT=0")
+    llama_test(test-les NAME test-les-runtime-rollback ARGS --case runtime-rollback --backend CPU)
+    set_tests_properties(test-les-runtime-rollback PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=2;LLAMA_MOE_LOOKAHEAD_PREFETCH=0;LLAMA_MOE_MATMUL_SPLIT=0;LLAMA_MOE_IO_THREADS=4")
+    llama_test(test-les NAME test-les-late-prefetch ARGS --case late-prefetch --backend CPU)
+    set_tests_properties(test-les-late-prefetch PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=3;LLAMA_MOE_WINDOW_MAX_ROWS=2;LLAMA_MOE_LOOKAHEAD_PREFETCH=1;LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH=1;LLAMA_MOE_MATMUL_SPLIT=0")
+    llama_test(test-les NAME test-les-late-prefetch-prefill ARGS --case late-prefetch-prefill --backend CPU)
+    set_tests_properties(test-les-late-prefetch-prefill PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=0;LLAMA_MOE_LOOKAHEAD_PREFETCH=1;LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH=1;LLAMA_MOE_MATMUL_SPLIT=0")
+    llama_test(test-les NAME test-les-late-prefetch-partition ARGS --case late-prefetch-partition --backend CPU)
+    set_tests_properties(test-les-late-prefetch-partition PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=3;LLAMA_MOE_WINDOW_MAX_ROWS=1;LLAMA_MOE_PREFETCH_UNIFIED=0;LLAMA_MOE_LOOKAHEAD_PREFETCH=1;LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH=1;LLAMA_MOE_MATMUL_SPLIT=0")
+    llama_test(test-les NAME test-les-deferred-rollback ARGS --case deferred-rollback --backend CPU)
+    set_tests_properties(test-les-deferred-rollback PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=2;LLAMA_MOE_LOOKAHEAD_PREFETCH=0;LLAMA_MOE_MATMUL_SPLIT=1")
+    llama_test(test-les NAME test-les-prefetch-rollback ARGS --case prefetch-rollback --backend CPU)
+    set_tests_properties(test-les-prefetch-rollback PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=3;LLAMA_MOE_WINDOW_MAX_ROWS=2;LLAMA_MOE_LOOKAHEAD_PREFETCH=1;LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH=1;LLAMA_MOE_MATMUL_SPLIT=0")
+    llama_test(test-les NAME test-les-prewarm-rollback ARGS --case prewarm-rollback --backend CPU)
+    set_tests_properties(test-les-prewarm-rollback PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=2;LLAMA_MOE_LOOKAHEAD_PREFETCH=0;LLAMA_MOE_MATMUL_SPLIT=0")
+    llama_test(test-les NAME test-les-runtime-decode-rollback ARGS --case runtime-decode-rollback --backend CPU)
+    set_tests_properties(test-les-runtime-decode-rollback PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=2;LLAMA_MOE_LOOKAHEAD_PREFETCH=0;LLAMA_MOE_MATMUL_SPLIT=0")
+    llama_test(test-les NAME test-les-runtime-abort-rollback ARGS --case runtime-abort-rollback --backend CPU)
+    set_tests_properties(test-les-runtime-abort-rollback PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=2;LLAMA_MOE_LOOKAHEAD_PREFETCH=0;LLAMA_MOE_MATMUL_SPLIT=0")
+    llama_test(test-les NAME test-les-prewarm-churn ARGS --case prewarm-churn --backend CPU)
+    set_tests_properties(test-les-prewarm-churn PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=2;LLAMA_MOE_LOOKAHEAD_PREFETCH=0;LLAMA_MOE_MATMUL_SPLIT=0")
+    llama_test(test-les NAME test-les-a2-contract ARGS --case a2-contract --backend CPU)
+    set_tests_properties(test-les-a2-contract PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=4;LLAMA_MOE_WINDOW_MAX_ROWS=2;LLAMA_MOE_LOOKAHEAD_PREFETCH=0;LLAMA_MOE_MATMUL_SPLIT=1")
+    llama_test(test-les NAME test-les-a2-prefetch ARGS --case a2-prefetch --backend CPU)
+    set_tests_properties(test-les-a2-prefetch PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=3;LLAMA_MOE_WINDOW_MAX_ROWS=2;LLAMA_MOE_LOOKAHEAD_PREFETCH=1;LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH=1;LLAMA_MOE_MATMUL_SPLIT=1")
+    llama_test(test-les NAME test-les-packed-inplace ARGS --case packed-inplace --backend CPU)
+    set_tests_properties(test-les-packed-inplace PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=0;LLAMA_MOE_LOOKAHEAD_PREFETCH=0;LLAMA_MOE_MATMUL_SPLIT=0")
+    llama_test(test-les NAME test-les-quantizer-per-layer-ffn ARGS --case quantizer-per-layer-ffn --backend CPU)
+    set_tests_properties(test-les-quantizer-per-layer-ffn PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=2;LLAMA_MOE_LOOKAHEAD_PREFETCH=0;LLAMA_MOE_MATMUL_SPLIT=0")
+    llama_test(test-les NAME test-les-predictor ARGS --case predictor --backend CPU)
+    set_tests_properties(test-les-predictor PROPERTIES ENVIRONMENT
+        "${LES_TEST_ENV};LLAMA_MOE_DECODE_WINDOW=0;LLAMA_MOE_LOOKAHEAD_PREFETCH=0;LLAMA_MOE_MATMUL_SPLIT=0")
+    unset(LES_TEST_ENV)
+endif()
+
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-command-r         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-command-r.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-deepseek-coder    ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-deepseek-coder.gguf)

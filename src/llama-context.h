@@ -280,7 +280,13 @@ private:
     //
 
     const llama_model & model;
+
+    // Declaration order also protects constructor exception unwinding: graph and
+    // scheduler references die before LES storage, which dies before backends.
+    ggml_backend_t backend_cpu = nullptr;
+    std::vector<ggml_backend_ptr> backends;
     std::unique_ptr<llama_moe_slot_runtime> moe_slots;
+    ggml_backend_sched_ptr sched;
 
     llama_cparams cparams;
 
@@ -344,12 +350,7 @@ private:
 
     std::vector<swap_info> output_swaps;
 
-    ggml_backend_sched_ptr sched;
-
     bool sched_need_reserve = true;
-
-    ggml_backend_t backend_cpu = nullptr;
-    std::vector<ggml_backend_ptr> backends;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

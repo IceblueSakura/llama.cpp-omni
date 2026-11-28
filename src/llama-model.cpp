@@ -28,12 +28,14 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -1000,6 +1002,7 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+    ggml_context_ptr expert_meta;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1043,30 +1046,6 @@ llama_model::~llama_model() {
 void llama_model_base::load_stats(llama_model_loader & ml) {
     pimpl->n_elements = ml.n_elements;
     pimpl->n_bytes = ml.n_bytes;
-}
-
-// Capability gate for an LES file: refuse one that asks for something this build cannot do.
-// Interpreting a newer field with older semantics gives a wrong result, silently.
-static void les_check_requires(const gguf_context * gctx) {
-    const int key_requires = gguf_find_key(gctx, "les.moe.requires");
-    if (key_requires < 0) {
-        return;
-    }
-    static const std::unordered_set<std::string> known = {
-        "moe.expert_major_packed_v1",
-    };
-    std::string missing;
-    for (uint32_t i = 0; i < gguf_get_arr_n(gctx, key_requires); ++i) {
-        const std::string capability = gguf_get_arr_str(gctx, key_requires, i);
-        if (!known.count(capability)) {
-            missing += (missing.empty() ? "" : ", ") + capability;
-        }
-    }
-    if (!missing.empty()) {
-        throw std::runtime_error(format(
-            "model requires expert-layout capabilities this build does not implement: %s",
-            missing.c_str()));
-    }
 }
 
 void llama_model_base::load_hparams(llama_model_loader & ml) {
@@ -1263,12 +1242,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 "moe_slot_bank is non-zero but the model file declares no 'les.moe.layout'");
         }
 
-        // Capability gate: refuse a file that asks for something this build cannot do.
-        les_check_requires(gctx);
-
-        pimpl->moe_experts = llama_moe_experts::from_layout(
-                gguf_get_val_str(gctx, key_layout),
-                ml.files.empty() ? std::string() : ml.files[0]->path());
+        pimpl->moe_experts = llama_moe_experts::from_gguf(
+                gctx, ml.files.empty() ? std::string() : ml.files[0]->path(), hparams.n_layer);
 
         // Take each carrier tensor out of weights_map. This is what makes the single-file
         // layout safe with mmap: afterwards load_all_data will not try to load it, size_data
@@ -1281,8 +1256,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                     "the expert layout references tensor '%s' but the model has no such tensor",
                     name.c_str()));
             }
-            pimpl->moe_experts->bind_region(name, region->offset, ml.files.at(region->idx)->path());
+            pimpl->moe_experts->bind_region(name, region->offset, region->nbytes, ml.files.at(region->idx)->path());
         }
+        ml.validate_expert_regions();
 
         LLAMA_LOG_INFO("%s: routed experts from the model file: %d layers, %zu regions, %.2f MiB total\n",
                 __func__, pimpl->moe_experts->layer_count(),
@@ -1301,10 +1277,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 throw std::runtime_error(
                     "an LES expert layout without a slot bank is currently supported only for minicpm5_moe");
             }
-            les_check_requires(gctx);
-            pimpl->moe_packed = llama_moe_experts::from_layout(
-                    gguf_get_val_str(gctx, key_layout),
-                    ml.files.empty() ? std::string() : ml.files[0]->path());
+            pimpl->moe_packed = llama_moe_experts::from_gguf(
+                    gctx, ml.files.empty() ? std::string() : ml.files[0]->path(), hparams.n_layer);
             if (pimpl->moe_packed->expert_count() != (int32_t) hparams.n_expert ||
                 pimpl->moe_packed->expert_used_count() != (int32_t) hparams.n_expert_used) {
                 throw std::runtime_error("LES expert layout counts do not match model metadata");
@@ -1313,12 +1287,37 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                     __func__, pimpl->moe_packed->layer_count(), pimpl->moe_packed->expert_count());
 
             // The carriers stay in weights_map, so nothing bounds the load-time prefetch by
-            // itself. Bound it at the first carrier: the resident prefix is read eagerly, the
-            // expert bytes page in on demand, which is the point of mapping them in place.
+            // itself. Validate all carriers and prefix ordering, then bound prefetch at the
+            // first carrier so resident weights load eagerly while experts page on demand.
+            std::unordered_set<std::string> carriers;
+            std::vector<size_t> first_carrier(ml.files.size(), SIZE_MAX);
             for (const auto & name : pimpl->moe_packed->region_names()) {
                 const auto it = ml.weights_map.find(name);
-                if (it != ml.weights_map.end()) {
-                    pimpl->moe_packed_begin = std::min(pimpl->moe_packed_begin, it->second.offs);
+                if (it == ml.weights_map.end()) {
+                    throw std::runtime_error(format(
+                        "the expert layout references tensor '%s' but the model has no such tensor",
+                        name.c_str()));
+                }
+                const auto & weight = it->second;
+                if (weight.tensor->type != GGML_TYPE_I8) {
+                    throw std::runtime_error(format(
+                        "expert layout: carrier '%s' must have type I8", name.c_str()));
+                }
+                pimpl->moe_packed->bind_region(
+                        name, weight.offs, ggml_nbytes(weight.tensor), ml.files.at(weight.idx)->path());
+                carriers.insert(name);
+                first_carrier.at(weight.idx) = std::min(first_carrier.at(weight.idx), weight.offs);
+                pimpl->moe_packed_begin = std::min(pimpl->moe_packed_begin, weight.offs);
+            }
+            for (const auto & item : ml.weights_map) {
+                if (carriers.count(item.first)) {
+                    continue;
+                }
+                const auto & weight = item.second;
+                if (weight.offs + ggml_nbytes(weight.tensor) > first_carrier.at(weight.idx)) {
+                    throw std::runtime_error(format(
+                        "expert layout: resident tensor '%s' must precede expert regions in its file",
+                        item.first.c_str()));
                 }
             }
         }
@@ -1656,6 +1655,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
     ml.done_getting_tensors(ml.partial_load);
+    pimpl->expert_meta = std::move(ml.expert_meta);
 
     GGML_ASSERT(!(output && tok_embd &&
             strcmp(output->name, tok_embd->name) == 0 &&
@@ -1861,21 +1861,9 @@ ggml_tensor * llama_model_base::create_tensor_own_alloc(llama_model_loader & ml,
 }
 
 ggml_tensor * llama_model_base::create_expert_tensor_from_manifest(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, ggml_type type) {
-    // gguf 里没有这个专家张量（已剥离），只能用 experts manifest 的形状/类型合成。
-    // 必须放在 alloc_only_buft 上：专家内容是 preadv 运行时写入的，不能被 mmap
-    // 的文件映射包住（见 create_tensor_own_alloc 的说明）。
-    ggml_backend_dev_t dev = tn.bid == -1
-        ? nullptr
-        : ggml_backend_buft_get_device(pimpl->dev_layer.at(tn.bid).buft_list->front().second);
-
-    const auto it = dev ? pimpl->alloc_only_buft.find(dev) : pimpl->alloc_only_buft.end();
-    if (it == pimpl->alloc_only_buft.end()) {
-        throw std::runtime_error(format(
-            "%s: backend has no alloc-only buft, cannot synthesize stripped expert tensor '%s'",
-            __func__, tn.str().c_str()));
-    }
-
-    return ml.create_tensor_alloc(hparams, it->second, tn.str(), ne, type);
+    // Only describe the stripped tensor here. Each llama_context owns its writable
+    // LES bank; these templates must never be mmap'd or allocated as model weights.
+    return ml.create_expert_template(hparams, tn.str(), ne, type);
 }
 
 std::string llama_model::arch_name() const {
@@ -2232,10 +2220,10 @@ bool llama_model::moe_expert_predictor_enabled() const {
 ggml_backend_buffer_type_t llama_model::moe_expert_predictor_buft() const {
     // The _prev weights are optional; the plain predictor weights are not.
     for (uint32_t il = hparams.n_layer_dense_lead; il < hparams.n_layer; ++il) {
-        if (layers[il].ffn_gate_inp_pred_prev) {
+        if (layers[il].ffn_gate_inp_pred_prev && layers[il].ffn_gate_inp_pred_prev->buffer) {
             return ggml_backend_buffer_get_type(layers[il].ffn_gate_inp_pred_prev->buffer);
         }
-        if (layers[il].ffn_gate_inp_pred) {
+        if (layers[il].ffn_gate_inp_pred && layers[il].ffn_gate_inp_pred->buffer) {
             return ggml_backend_buffer_get_type(layers[il].ffn_gate_inp_pred->buffer);
         }
     }
@@ -2366,6 +2354,16 @@ const llama_moe_experts_entry * llama_model::moe_packed_entry(const char * tenso
 
 ggml_tensor * llama_model_base::create_packed_expert_view(llama_model_loader & ml, const LLM_TN_IMPL & tn,
         const std::initializer_list<int64_t> & ne, const llama_moe_experts_entry & entry) {
+    if (ne.size() != 3 || ne.begin()[0] <= 0 || ne.begin()[1] <= 0 || ne.begin()[2] != entry.expert_count) {
+        throw std::runtime_error(format(
+            "expert tensor '%s' shape mismatch against layout", tn.str().c_str()));
+    }
+    const size_t row_bytes = ggml_row_size(entry.type, ne.begin()[0]);
+    if (size_t(ne.begin()[1]) > std::numeric_limits<size_t>::max() / row_bytes ||
+            row_bytes * size_t(ne.begin()[1]) != entry.bytes_per_expert) {
+        throw std::runtime_error(format(
+            "expert tensor '%s' byte size mismatch against layout", tn.str().c_str()));
+    }
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     ggml_tensor * carrier = ml.create_packed_carrier(hparams, buft_list_layer, entry.packed_tensor_name, entry.type, ne);
     if (ggml_nbytes(carrier) != entry.expert_stride * (size_t) entry.expert_count) {

@@ -324,6 +324,31 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
 
+#ifdef GGML_METAL_TESTING
+// Thread-local private controls; absent from production builds and public ABI.
+enum ggml_metal_test_failure {
+    GGML_METAL_TEST_NONE,
+    GGML_METAL_TEST_METADATA,
+    GGML_METAL_TEST_HOST,
+    GGML_METAL_TEST_BUFFER,
+    GGML_METAL_TEST_RSET,
+    GGML_METAL_TEST_RSET_CREATED,
+};
+struct ggml_metal_test_config {
+    enum ggml_metal_test_failure failure;
+    int nth;
+    size_t map_max_size;
+    bool override_memory;
+    size_t total, allocated;
+};
+struct ggml_metal_test_stats {
+    int64_t metadata, host_bytes, buffers, rsets, registered;
+    int injected;
+};
+void ggml_metal_test_configure(struct ggml_metal_test_config config);
+struct ggml_metal_test_stats ggml_metal_test_get_stats(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

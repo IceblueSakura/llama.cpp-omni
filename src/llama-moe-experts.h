@@ -38,13 +38,16 @@ struct llama_moe_experts_entry {
 // resolved where the carrier tensors sit, so `bind_region()` has to be called for each.
 class llama_moe_experts {
 public:
+    static std::unique_ptr<llama_moe_experts> from_gguf(
+            const struct gguf_context * metadata, const std::string & path_model, int32_t n_layers);
     static std::unique_ptr<llama_moe_experts> from_layout(
             const std::string & layout_json, const std::string & path_model);
 
-    /// Resolve the absolute offsets of every entry carried by `packed_tensor_name`,
-    /// now that the loader knows where that tensor lives.
+    /// Validate the actual carrier byte extent, then resolve absolute offsets.
+    /// The loader separately requires an I8 carrier and in-file tensor bounds.
     void bind_region(const std::string & packed_tensor_name,
                      size_t tensor_offset,
+                     size_t tensor_bytes,
                      const std::string & path);
 
     /// Carrier tensor names, deduplicated and sorted.
@@ -69,6 +72,7 @@ private:
     int32_t n_expert_used = 0;
     int32_t n_layer = 0;
     size_t bytes_per_slot = 0;
+    size_t alignment = 0;
     /// Bytes of one expert slot per layer id. Distinct from `bytes_per_slot`, which is
     /// the sum over layers; a caller budgeting a per-layer cache needs this one.
     std::vector<size_t> bytes_per_slot_layer;

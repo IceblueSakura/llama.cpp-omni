@@ -35,7 +35,6 @@ llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
-    moe_slots(model.moe_slot_bank_enabled() ? std::make_unique<llama_moe_slot_runtime>(model) : nullptr),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -381,7 +380,8 @@ llama_context::llama_context(
             model.n_gpu_layers() > model.hparams.n_layer &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides();
+            !model.has_tensor_overrides() &&
+            !model.moe_slot_bank_enabled();
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -409,6 +409,10 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (model.moe_slot_bank_enabled()) {
+            moe_slots = std::make_unique<llama_moe_slot_runtime>(model);
+            set_abort_callback(abort_callback, abort_callback_data);
+        }
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -430,6 +434,9 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -447,6 +454,10 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+    gf_res_prev.reset();
+    gf_res_reserve.reset();
+    sched.reset();
+    moe_slots.reset();
 }
 
 void llama_context::sched_reserve() {
@@ -473,6 +484,12 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (moe_slots) {
+        ggml_backend_sched_set_copy_callback(sched.get(),
+            [](ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * ud) {
+                return static_cast<llama_moe_slot_runtime *>(ud)->copy_weights(backend, src, dst, graph);
+            }, moe_slots.get());
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1132,7 +1149,15 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
         if (reg) {
             auto * set_abort_callback_fn = (ggml_backend_set_abort_callback_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_abort_callback");
             if (set_abort_callback_fn) {
-                set_abort_callback_fn(backend.get(), this->abort_callback, this->abort_callback_data);
+                if (moe_slots) {
+                    set_abort_callback_fn(backend.get(), [](void * data) {
+                        auto * ctx = static_cast<llama_context *>(data);
+                        return ctx->moe_slots->failed() ||
+                            (ctx->abort_callback && ctx->abort_callback(ctx->abort_callback_data));
+                    }, this);
+                } else {
+                    set_abort_callback_fn(backend.get(), this->abort_callback, this->abort_callback_data);
+                }
             }
         }
     }
@@ -1508,6 +1533,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (moe_slots) {
+        // The last MoE layer can see fewer rows after output selection. Its
+        // installer must use the same ubatch phase as graph_params().
+        moe_slots->set_ubatch_size(ubatch.n_tokens);
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -2609,7 +2639,26 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    if (moe_slots) {
+        moe_slots->reset_failure();
+    }
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    if (moe_slots && (status != GGML_STATUS_SUCCESS || moe_slots->failed())) {
+        // Even an aborted graph may have submitted earlier GPU splits. Keep
+        // their storage alive until completion, then cancel unconsumed A2 slots.
+        ggml_backend_sched_synchronize(sched.get());
+        moe_slots->cancel_compute();
+        if (auto error = moe_slots->failure()) {
+            try {
+                std::rethrow_exception(error);
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR("%s: LES installation failed: %s\n", __func__, e.what());
+            } catch (...) {
+                LLAMA_LOG_ERROR("%s: LES installation failed with an unknown exception\n", __func__);
+            }
+            status = GGML_STATUS_FAILED;
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -2625,6 +2674,22 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        // Host LES banks are staging weights, not a request for CPU matmuls.
+        // Explicitly place their consumers on the model's selected layer device.
+        if (moe_slots && il >= 0 && cur->op == GGML_OP_MUL_MAT_ID &&
+                moe_slots->owns_tensor(cur->src[0])) {
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == model.dev_layer(il)) {
+                    if (!ggml_backend_supports_op(backend.get(), cur)) {
+                        throw std::runtime_error(format("LES matmul '%s' is unsupported by %s",
+                            cur->name, ggml_backend_name(backend.get())));
+                    }
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                    break;
+                }
+            }
         }
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
@@ -3372,6 +3437,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
         ret[buft].model += size;
+    }
+    if (moe_slots) {
+        for (const auto & [buft, size] : moe_slots->memory_breakdown()) {
+            ret[buft].context += size;
+        }
     }
     if (memory) {
         for (const auto & [buft, size] : memory->memory_breakdown()) {

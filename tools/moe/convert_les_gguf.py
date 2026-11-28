@@ -191,12 +191,14 @@ def scan(source: GGUFReader) -> tuple[dict[int, list], list, str, int, int]:
 
     for layer, families in experts.items():
         names = [f for f, _ in families]
-        if GATE_UP_FAMILY in names and len(names) > 1:
+        if GATE_UP_FAMILY in names and {"ffn_gate_exps", "ffn_up_exps"} & set(names):
             raise PackError(
                 f"layer {layer} has {GATE_UP_FAMILY} alongside separate gate/up tensors")
         if GATE_UP_FAMILY not in names and not {"ffn_gate_exps", "ffn_up_exps"} <= set(names):
             raise PackError(
                 f"layer {layer} has {sorted(names)}; expected {GATE_UP_FAMILY} or both gate and up")
+        if "ffn_down_exps" not in names:
+            raise PackError(f"layer {layer} has no ffn_down_exps")
 
     # 一个保守的几何校验：每层每个专家的三段字节数必须是 32 的倍数。
     for layer, families in experts.items():
@@ -273,7 +275,7 @@ def build_layout(experts: dict[int, list], n_expert: int, n_expert_used: int) ->
                     "offset_in_expert": offset,
                     "bytes_per_expert": per_expert,
                     "type": tensor.tensor_type.name,
-                    "ne": shape[:2],
+                    "ne": [int(v) for v in tensor.shape[:2]],
                 } for family, tensor, offset, per_expert in families],
             }],
         })
@@ -285,57 +287,98 @@ def build_layout(experts: dict[int, list], n_expert: int, n_expert_used: int) ->
     }
 
 
-def check_layout(layout: dict, tensors: dict | None) -> None:
-    """执行 docs/les/les-gguf-format.md 的不变量。
+def check_layout(layout: dict, tensors: dict | None, gguf_alignment: int = REGION_ALIGN) -> None:
+    """Validate the packed layout before writing and after reading it."""
+    maximum = 2 * sys.maxsize + 1
 
-    `pack` 写盘前和 `probe` 读入后跑同一份校验 —— 只有一个规则表，才不会出现
-    「工具产得出、引擎读不了」的缝隙。
-    """
+    def integer(value, field, upper=maximum):
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= upper:
+            raise PackError(f"{field} must be a nonnegative integer <= {upper}")
+        return value
+
+    if not isinstance(layout, dict):
+        raise PackError("layout must be an object")
     if layout.get("layout") != LAYOUT_KIND:
         raise PackError(f"layout '{layout.get('layout')}' is not '{LAYOUT_KIND}'")
+    if integer(layout.get("les_version", 1), "les_version") != 1:
+        raise PackError("unsupported les_version")
+    alignment = integer(layout.get("alignment", gguf_alignment), "alignment")
+    if alignment < 2048 or alignment & (alignment - 1) or alignment != gguf_alignment:
+        raise PackError("alignment must be a power of two >= 2048 matching the GGUF")
     layers = layout.get("layers")
-    if not layers:
+    if not isinstance(layers, list) or not layers:
         raise PackError("layout declares no layers")
 
-    carriers = set()
+    defaults = layout.get("defaults", {})
+    if not isinstance(defaults, dict):
+        raise PackError("defaults must be an object")
+    carriers, layer_ids = set(), set()
+    counts = None
+    total_slot_bytes = 0
     for layer in layers:
-        n_expert = int(layer["n_expert"])
+        if not isinstance(layer, dict):
+            raise PackError("layer must be an object")
+        layer_id = integer(layer["layer"], "layer", 2**31 - 1)
+        if layer_id in layer_ids:
+            raise PackError(f"duplicate layer {layer_id}")
+        layer_ids.add(layer_id)
+        n_expert = integer(layer["n_expert"], "n_expert", 2**31 - 1)
+        used = integer(layer.get("n_expert_used",
+            defaults.get("n_expert_used", n_expert)), "n_expert_used", 2**31 - 1)
+        if not 0 < used <= n_expert:
+            raise PackError(f"layer {layer_id}: invalid expert counts")
+        if counts is not None and counts != (n_expert, used):
+            raise PackError("expert counts and top-k must be uniform across layers")
+        counts = n_expert, used
+        groups = layer.get("groups")
+        if not isinstance(groups, list) or not groups:
+            raise PackError(f"layer {layer_id}: no groups")
         covered = 0
-        for group in layer["groups"]:
-            begin = int(group["expert_begin"])
-            count = int(group["expert_count"])
-            stride = int(group["expert_stride"])
-            if begin != covered:
-                raise PackError(
-                    f"layer {layer['layer']}: group starts at expert {begin}, expected {covered}")
-            if count <= 0 or begin + count > n_expert:
-                raise PackError(
-                    f"layer {layer['layer']}: group [{begin},+{count}) exceeds n_expert={n_expert}")
-            if stride % TENSOR_ALIGN:
-                raise PackError(
-                    f"layer {layer['layer']}: expert_stride {stride} is not a multiple of {TENSOR_ALIGN}")
+        for group in groups:
+            if not isinstance(group, dict):
+                raise PackError("group must be an object")
+            begin = integer(group["expert_begin"], "expert_begin", 2**31 - 1)
+            count = integer(group["expert_count"], "expert_count", 2**31 - 1)
+            stride = integer(group["expert_stride"], "expert_stride")
+            if begin != covered or count <= 0 or begin + count > n_expert:
+                raise PackError(f"layer {layer_id}: groups do not cover experts contiguously")
+            if stride <= 0 or stride % TENSOR_ALIGN or stride * count > maximum:
+                raise PackError(f"layer {layer_id}: invalid or overflowing expert_stride")
+            total_slot_bytes += stride
+            if total_slot_bytes > maximum:
+                raise PackError("total expert slot byte size overflows")
 
-            names, total = set(), 0
-            for tensor in group["tensors"]:
+            names, intervals = set(), []
+            families = group.get("tensors")
+            if not isinstance(families, list) or not families:
+                raise PackError(f"layer {layer_id}: no tensor families")
+            for tensor in families:
+                if not isinstance(tensor, dict):
+                    raise PackError("tensor family must be an object")
                 family = tensor["tensor_family"]
+                if not isinstance(family, str) or not family:
+                    raise PackError("tensor family name must be a nonempty string")
                 if family in names:
-                    raise PackError(f"layer {layer['layer']}: duplicate tensor '{family}'")
+                    raise PackError(f"layer {layer_id}: duplicate tensor '{family}'")
                 names.add(family)
-                offset = int(tensor["offset_in_expert"])
-                per_expert = int(tensor["bytes_per_expert"])
-                if offset % TENSOR_ALIGN or per_expert % TENSOR_ALIGN:
-                    raise PackError(
-                        f"layer {layer['layer']}: '{family}' is not {TENSOR_ALIGN}-byte aligned")
-                if offset + per_expert > stride:
-                    raise PackError(
-                        f"layer {layer['layer']}: '{family}' runs past expert_stride "
-                        f"({offset}+{per_expert} > {stride})")
-                total += per_expert
-            if total != stride:
-                raise PackError(
-                    f"layer {layer['layer']}: tensors sum to {total} but expert_stride is {stride}")
+                offset = integer(tensor["offset_in_expert"], "offset_in_expert")
+                size = integer(tensor["bytes_per_expert"], "bytes_per_expert")
+                if size <= 0 or offset % TENSOR_ALIGN or size % TENSOR_ALIGN:
+                    raise PackError(f"layer {layer_id}: '{family}' has invalid size/alignment")
+                if offset > stride or size > stride - offset:
+                    raise PackError(f"layer {layer_id}: '{family}' runs past expert_stride")
+                intervals.append((offset, offset + size))
+            end = 0
+            for begin_byte, end_byte in sorted(intervals):
+                if begin_byte != end:
+                    raise PackError(f"layer {layer_id}: tensor families overlap or leave a gap")
+                end = end_byte
+            if end != stride:
+                raise PackError(f"layer {layer_id}: tensor families do not fill expert_stride")
 
             name = group["tensor_name"]
+            if not isinstance(name, str) or not name or name in carriers:
+                raise PackError("carrier tensor must be unique to one group")
             carriers.add(name)
             if tensors is not None:
                 info = tensors.get(name)
@@ -346,29 +389,18 @@ def check_layout(layout: dict, tensors: dict | None) -> None:
                 want = stride * count
                 if info.n_bytes != want:
                     raise PackError(f"'{name}': {info.n_bytes} bytes, expected {want}")
-
+                if int(info.data_offset) % alignment:
+                    raise PackError(f"'{name}': carrier offset is not {alignment}-byte aligned")
             covered = begin + count
         if covered != n_expert:
-            raise PackError(
-                f"layer {layer['layer']}: groups cover {covered} of {n_expert} experts")
+            raise PackError(f"layer {layer_id}: groups cover {covered} of {n_expert} experts")
 
     if tensors is None:
         return
-
-    # 常驻张量必须全部排在专家区之前：加载期的预读上界取第一个专家区的偏移。
     first_carrier = min(int(tensors[name].data_offset) for name in carriers)
-    if first_carrier % REGION_ALIGN:
-        raise PackError(
-            f"expert region starts at {first_carrier}, not a multiple of {REGION_ALIGN}; "
-            f"tensor data would be written with general.alignment={REGION_ALIGN}")
     for name, info in tensors.items():
-        if name in carriers:
-            continue
-        end = int(info.data_offset) + info.n_bytes
-        if end > first_carrier:
-            raise PackError(
-                f"resident tensor '{name}' ends at {end}, past the expert region at "
-                f"{first_carrier}; resident tensors must come first")
+        if name not in carriers and int(info.data_offset) + info.n_bytes > first_carrier:
+            raise PackError(f"resident tensor '{name}' must precede the expert regions")
 
 
 def set_thinking(template: str, enable: bool) -> tuple[str, str]:
@@ -598,7 +630,7 @@ def verify(args: argparse.Namespace) -> int:
         return 1
     layout = json.loads(str(field.contents()))
     try:
-        check_layout(layout, by_name)
+        check_layout(layout, by_name, int(packed.alignment))
     except PackError as error:
         print(f"layout invalid: {error}")
         return 1
@@ -657,7 +689,7 @@ def probe(args: argparse.Namespace) -> int:
 
     layout = json.loads(str(field.contents()))
     by_name = {t.name: t for t in reader.tensors}
-    check_layout(layout, by_name)
+    check_layout(layout, by_name, int(reader.alignment))
 
     carrier_names = {g["tensor_name"] for x in layout["layers"] for g in x["groups"]}
     per_layer = [{

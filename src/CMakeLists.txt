@@ -34,6 +34,8 @@ add_library(llama
             llama-moe-experts.h
             llama-moe-slot.cpp
             llama-moe-slot.h
+            llama-moe-storage.cpp
+            llama-moe-storage.h
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp

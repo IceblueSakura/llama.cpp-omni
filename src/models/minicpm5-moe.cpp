@@ -2,6 +2,8 @@
 #include "llama-moe-experts.h"
 #include "llama-moe-slot.h"
 
+#include <tuple>
+
 void llama_model_minicpm5_moe::load_arch_hparams(llama_model_loader & ml) {
     if (hparams.n_embd_head_k_full != hparams.n_embd_head_v_full) {
         throw std::runtime_error("MiniCPM5 MoE requires equal key and value head sizes");
@@ -63,14 +65,14 @@ void llama_model_minicpm5_moe::load_arch_tensors(llama_model_loader & ml) {
         LLM_TENSOR_FFN_UP_EXPS,      LLM_TENSOR_FFN_DOWN_EXPS,
     };
 
-    // family -> (bytes_per_expert -> 层号升序)
-    std::map<size_t, std::vector<int>> groups[4];
+    // family -> ((type, n_ff_exp, bytes_per_expert) -> 层号升序)
+    std::map<std::tuple<ggml_type, int64_t, size_t>, std::vector<int>> groups[4];
     if (moe_slot_bank_enabled()) {
         for (int il = n_dense; il < n_layer; ++il) {
             for (int fi = 0; fi < 4; ++fi) {
                 const auto * e = moe_experts_entry(tn(fam_ids[fi], "weight", il).str().c_str());
                 if (e) {
-                    groups[fi][e->bytes_per_expert].push_back(il);
+                    groups[fi][{e->type, (int64_t) hparams.n_ff_exp_arr[il], e->bytes_per_expert}].push_back(il);
                 }
             }
         }
@@ -364,10 +366,20 @@ llama_model_minicpm5_moe::graph::graph(const llama_model & model, const llm_grap
     // current_prev: the previous token's ffn_norm per block. Two banks, one per ubatch parity:
     // each ubatch reads the bank the previous ubatch wrote and writes the other, so no row is
     // read and written by the same graph regardless of the order the backend runs the nodes.
+    bool has_pred_prev = false;
+    if (keep_prev) {
+        for (int il = (int) hparams.n_layer_dense_lead; il < n_layer; ++il) {
+            if (model.layers[il].ffn_gate_inp_pred_prev != nullptr) {
+                has_pred_prev = true;
+                break;
+            }
+        }
+    }
+
     ggml_tensor * prev_state   = nullptr;
     ggml_tensor * prev_rd_rows = nullptr;
     ggml_tensor * prev_wr_rows = nullptr;
-    if (keep_prev) {
+    if (keep_prev && has_pred_prev) {
         ggml_backend_buffer_type_t buft = model.moe_expert_predictor_buft();
         if (buft) {
             prev_state = moe_slots->predictor_state(n_embd, 2 * n_layer, buft);

@@ -141,6 +141,8 @@ struct llama_model_loader {
     };
 
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    // LES bank templates are metadata only; writable storage belongs to a context.
+    ggml_context_ptr expert_meta;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
@@ -213,14 +215,10 @@ struct llama_model_loader {
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
-    /// 在**指定的 buft** 上新建一个空张量（不读 gguf、不进 weights_map）。
-    ///
-    /// 给「内容不由模型文件提供」的张量用：MoE 专家剥离出 gguf 之后，gguf 里根本没有
-    /// 这些张量，只能用 experts manifest 里的形状/类型合成一个占位张量，内容后续由
-    /// preadv 填。不进 weights_map 是关键 —— 否则 load_all_data 会去文件里找它们。
-    struct ggml_tensor * create_tensor_alloc(
+    // Metadata-only LES template, outside weights_map and ctx_map. Contexts
+    // clone its geometry into their own writable bank.
+    struct ggml_tensor * create_expert_template(
         const llama_hparams & hparams,
-        ggml_backend_buffer_type_t buft,
         const std::string & name,
         const std::initializer_list<int64_t> & ne,
         enum ggml_type type);
@@ -287,6 +285,7 @@ struct llama_model_loader {
     ///
     /// 名字不在文件里时返回 nullptr —— manifest 布局走的就是这条路。
     const llama_moe_region * take_expert_region(const char * name);
+    void validate_expert_regions() const;
 
     /// 专家区的最小文件偏移；没有专家区时为 (size_t) -1。
     /// init_mappings() 用它把加载期预读限制在常驻前缀内。

@@ -1501,6 +1501,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s) const {
+    if (moe_slots && moe_slots->uses_layer(il)) {
+        gate_up_exps = moe_slots->bank_tensor(gate_up_exps, moe_decode_phase);
+        gate_exps    = moe_slots->bank_tensor(gate_exps, moe_decode_phase);
+        up_exps      = moe_slots->bank_tensor(up_exps, moe_decode_phase);
+        down_exps    = moe_slots->bank_tensor(down_exps, moe_decode_phase);
+    }
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1634,9 +1640,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    const bool split_moe = moe_decode_phase &&
+        moe_slots && moe_slots->uses_layer(il) && moe_slots->matmul_split() > 0 &&
+        !weight_before_ffn && !gate_up_exps && gate_exps && up_exps && down_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b &&
+        !up_exps_s && !gate_exps_s && !down_exps_s &&
+        (int) n_expert_used > moe_slots->matmul_split();
     ggml_tensor * selected_experts_mm = selected_experts;
     if (moe_slots && moe_slots->uses_layer(il)) {
-        selected_experts_mm = moe_slots->build_slot_ids_tensor(ctx0, selected_experts, il);
+        selected_experts_mm = moe_slots->build_slot_ids_tensor(ctx0, selected_experts, il, split_moe);
         cb(selected_experts_mm, "ffn_moe_slots", il);
     }
 
@@ -1661,12 +1673,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //   - prefill 是带宽受限（93% 时间在读），重叠延迟没有意义，反而多一次 matmul
     //   - prefill 走 mul_mm_id，它的 map0 kernel 只对特定 ne20 预编译
     //     （实测 ne20=7/5 编译失败），decode 走 mul_mv_id 没这个限制
-    if (moe_decode_phase &&
-        moe_slots && moe_slots->uses_layer(il) && moe_slots->matmul_split() > 0 &&
-        !weight_before_ffn && !gate_up_exps && gate_exps && up_exps && down_exps &&
-        !up_exps_b && !gate_exps_b && !down_exps_b &&
-        !up_exps_s && !gate_exps_s && !down_exps_s &&
-        (int) n_expert_used > moe_slots->matmul_split()) {
+    if (split_moe) {
         const int split_at = (int) n_expert_used - moe_slots->matmul_split();
         auto slice_ids = [&](ggml_tensor * t, int lo, int hi) {
             return ggml_view_2d(ctx0, t, hi - lo, n_tokens, t->nb[1], (size_t) lo * t->nb[0]);

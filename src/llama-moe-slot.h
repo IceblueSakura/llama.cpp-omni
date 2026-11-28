@@ -4,15 +4,34 @@
 #include "ggml-backend.h"
 
 #include <memory>
+#include <map>
+#include <functional>
+#include <exception>
 
 struct llama_model;
 
 class llama_moe_slot_runtime {
 public:
-    explicit llama_moe_slot_runtime(const llama_model & model);
+    // Observe a worker before it claims storage, without replacing its real I/O.
+    explicit llama_moe_slot_runtime(const llama_model & model,
+        std::function<void(int, int)> before_prefetch = {},
+        std::function<void()> before_wait = {});
     ~llama_moe_slot_runtime();
 
     bool uses_layer(int layer) const;
+    ggml_tensor * bank_tensor(const ggml_tensor * tensor, bool decode) const;
+    bool owns_tensor(const ggml_tensor * tensor) const;
+    bool copy_weights(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+    uint64_t uploaded_bytes() const;
+    // Custom CPU ops transfer failures to the context's abort/status path;
+    // exceptions must never unwind through the CPU worker pool.
+    bool failed() const;
+    std::exception_ptr failure() const;
+    void reset_failure();
+    void set_ubatch_size(int32_t n_tokens);
+    // Caller must first synchronize submitted backend work.
+    void cancel_compute();
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
     bool lookahead_prefetch_enabled() const;
     int  lookahead_prefetch_depth() const;
     /// 每层 decode 窗口宽度（slot 数）。0 = 未启用按层窗口。
@@ -44,9 +63,9 @@ public:
     ggml_tensor * build_slot_ids_tensor(
         ggml_context * ctx,
         ggml_tensor * expert_ids,
-        int layer);
+        int layer, bool defer = false);
     void process(int layer, const ggml_tensor * expert_ids, ggml_tensor * slot_ids,
-                 const ggml_tensor * lookahead_pred = nullptr);
+                 const ggml_tensor * lookahead_pred = nullptr, bool defer = false);
 
     /// 累加「图执行期间的专家管理耗时」（`map_custom` 回调内）。
     ///

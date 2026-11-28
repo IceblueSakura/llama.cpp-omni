@@ -1,6 +1,7 @@
 #include "llama-moe-experts.h"
 
 #include "llama-impl.h"
+#include "llama-hparams.h"
 
 #include "gguf.h"
 #include "llama.h"
@@ -52,7 +53,72 @@ std::string layer_tensor_name(int32_t layer, const std::string & tensor_family) 
     return format("blk.%d.%s.weight", layer, tensor_family.c_str());
 }
 
+uint64_t layout_uint(const nlohmann::json & value, const char * field,
+                     uint64_t maximum = std::numeric_limits<size_t>::max()) {
+    if (!value.is_number_integer() ||
+            (!value.is_number_unsigned() && value.get<int64_t>() < 0) ||
+            value.get<uint64_t>() > maximum) {
+        throw std::runtime_error(format("expert layout: '%s' must be a nonnegative integer <= %llu",
+            field, (unsigned long long) maximum));
+    }
+    return value.get<uint64_t>();
+}
+
+size_t checked_add(size_t a, size_t b) {
+    if (b > std::numeric_limits<size_t>::max() - a) {
+        throw std::runtime_error("expert layout: byte offset/size overflow");
+    }
+    return a + b;
+}
+
+size_t checked_mul(size_t a, size_t b) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+        throw std::runtime_error("expert layout: byte size overflow");
+    }
+    return a * b;
+}
+
 } // namespace
+
+std::unique_ptr<llama_moe_experts> llama_moe_experts::from_gguf(
+        const gguf_context * metadata, const std::string & path_model, int32_t n_layers) {
+    const int64_t key = gguf_find_key(metadata, "les.moe.layout");
+    if (key < 0 || gguf_get_kv_type(metadata, key) != GGUF_TYPE_STRING) {
+        throw std::runtime_error("expert layout: 'les.moe.layout' must be a string");
+    }
+    // Older v1 writers omitted version/requires. Absence retains that v1
+    // interpretation; an explicit unknown version or capability never does.
+    const int64_t version = gguf_find_key(metadata, "les.moe.version");
+    if (version >= 0 && (gguf_get_kv_type(metadata, version) != GGUF_TYPE_UINT32 ||
+            gguf_get_val_u32(metadata, version) != 1)) {
+        throw std::runtime_error("expert layout: unsupported 'les.moe.version' (expected uint32 1)");
+    }
+    const int64_t key_requires = gguf_find_key(metadata, "les.moe.requires");
+    if (key_requires >= 0) {
+        if (gguf_get_kv_type(metadata, key_requires) != GGUF_TYPE_ARRAY ||
+                gguf_get_arr_type(metadata, key_requires) != GGUF_TYPE_STRING) {
+            throw std::runtime_error("expert layout: 'les.moe.requires' must be a string array");
+        }
+        for (size_t i = 0; i < gguf_get_arr_n(metadata, key_requires); ++i) {
+            const std::string capability = gguf_get_arr_str(metadata, key_requires, i);
+            if (capability != "moe.expert_major_packed_v1") {
+                throw std::runtime_error(format("expert layout: unsupported required capability '%s'",
+                    capability.c_str()));
+            }
+        }
+    }
+    auto out = from_layout(gguf_get_val_str(metadata, key), path_model);
+    if (n_layers <= 0 || out->bytes_per_slot_layer.size() > (size_t) n_layers) {
+        throw std::runtime_error("expert layout: layer index exceeds model layer count");
+    }
+    const size_t alignment = gguf_get_alignment(metadata);
+    if (alignment < 2048 || (alignment & (alignment - 1)) ||
+            (out->alignment && out->alignment != alignment)) {
+        throw std::runtime_error("expert layout: alignment must match the page-aligned GGUF layout");
+    }
+    out->alignment = alignment;
+    return out;
+}
 
 std::unique_ptr<llama_moe_experts> llama_moe_experts::from_layout(
         const std::string & layout_json, const std::string & path_model) {
@@ -73,26 +139,29 @@ std::unique_ptr<llama_moe_experts> llama_moe_experts::from_layout(
     }
 
     auto out = std::unique_ptr<llama_moe_experts>(new llama_moe_experts());
+    if (layout.contains("les_version") && layout_uint(layout.at("les_version"), "les_version") != 1) {
+        throw std::runtime_error("expert layout: unsupported JSON les_version");
+    }
+    if (layout.contains("alignment")) {
+        out->alignment = layout_uint(layout.at("alignment"), "alignment");
+        if (out->alignment < 2048 || (out->alignment & (out->alignment - 1))) {
+            throw std::runtime_error("expert layout: alignment must be a power of two >= 2048");
+        }
+    }
 
     // 每一层的声明都是权威；这里只保留一个全局副本，用来给 slot 记账提供单一几何。
     int32_t n_expert      = -1;
     int32_t n_expert_used = -1;
     std::unordered_set<int32_t> layers;
+    std::unordered_set<std::string> carriers;
 
-    std::vector<const nlohmann::json *> layer_items;
-    layer_items.reserve(layout.at("layers").size());
     for (const auto & item : layout.at("layers")) {
-        layer_items.push_back(&item);
-    }
-    std::sort(layer_items.begin(), layer_items.end(),
-              [](const nlohmann::json * a, const nlohmann::json * b) {
-                  return a->at("layer").get<int32_t>() < b->at("layer").get<int32_t>();
-              });
-
-    for (const nlohmann::json * item : layer_items) {
-        const int32_t layer       = item->at("layer").get<int32_t>();
-        const int32_t layer_experts = item->at("n_expert").get<int32_t>();
-        const int32_t layer_used    = item->value("n_expert_used", layer_experts);
+        const int32_t layer = layout_uint(item.at("layer"), "layer", LLAMA_MAX_LAYERS - 1);
+        const int32_t layer_experts = layout_uint(item.at("n_expert"), "n_expert", INT32_MAX);
+        const auto & defaults = layout.contains("defaults") ? layout.at("defaults") : nlohmann::json::object();
+        const auto used = item.contains("n_expert_used") ? item.at("n_expert_used") :
+            defaults.value("n_expert_used", nlohmann::json(layer_experts));
+        const int32_t layer_used = layout_uint(used, "n_expert_used", INT32_MAX);
 
         if (layer < 0 || layer_experts <= 0 || layer_used <= 0 || layer_used > layer_experts) {
             throw std::runtime_error(format(
@@ -104,59 +173,70 @@ std::unique_ptr<llama_moe_experts> llama_moe_experts::from_layout(
         if (n_expert < 0) {
             n_expert      = layer_experts;
             n_expert_used = layer_used;
-        } else if (layer_experts != n_expert) {
+        } else if (layer_experts != n_expert || layer_used != n_expert_used) {
             // 这个构建要求所有层用同一个专家数：计算图的 expert 轴、slot 记账和预读
             // 都是按单值分配的。不一致时明确拒绝，而不是静默地算出错的结果。
             throw std::runtime_error(format(
-                "expert layout: layer %d has %d experts but layer 0 has %d; "
-                "this build requires a uniform expert count across layers",
-                layer, layer_experts, n_expert));
+                "expert layout: layer %d has expert counts/top-k %d/%d, expected %d/%d; "
+                "this build requires uniform expert counts and top-k across layers",
+                layer, layer_experts, layer_used, n_expert, n_expert_used));
         }
 
-        if (!item->contains("groups") || !item->at("groups").is_array() ||
-                item->at("groups").empty()) {
+        if (!item.contains("groups") || !item.at("groups").is_array() ||
+                item.at("groups").empty()) {
             throw std::runtime_error(format("expert layout: layer %d has no groups", layer));
         }
-        if (item->at("groups").size() > 1) {
+        if (item.at("groups").size() > 1) {
             // 一个 group 对应一族固定的 slot 张量几何。这个构建只支持每层一个 group。
             throw std::runtime_error(format(
                 "expert layout: layer %d has %zu groups; this build supports one group per layer",
-                layer, item->at("groups").size()));
+                layer, item.at("groups").size()));
         }
 
         size_t  layer_slot_bytes = 0;
         int32_t covered          = 0;
-        for (const auto & group : item->at("groups")) {
-            const int32_t     expert_begin = group.at("expert_begin").get<int32_t>();
-            const int32_t     group_count  = group.at("expert_count").get<int32_t>();
-            const size_t      expert_stride = group.at("expert_stride").get<size_t>();
+        for (const auto & group : item.at("groups")) {
+            const int32_t expert_begin = layout_uint(group.at("expert_begin"), "expert_begin", INT32_MAX);
+            const int32_t group_count = layout_uint(group.at("expert_count"), "expert_count", INT32_MAX);
+            const size_t expert_stride = layout_uint(group.at("expert_stride"), "expert_stride");
             const std::string tensor_name   = group.at("tensor_name").get<std::string>();
 
             if (expert_begin != covered || group_count <= 0 ||
-                    expert_begin + group_count > layer_experts) {
+                    expert_begin > layer_experts || group_count > layer_experts - expert_begin) {
                 throw std::runtime_error(format(
                     "expert layout: layer %d group [%d,+%d) does not cover experts contiguously "
                     "(covered up to %d of %d)",
                     layer, expert_begin, group_count, covered, layer_experts));
             }
-            if (expert_stride % LES_TENSOR_ALIGN) {
+            if (expert_stride == 0 || expert_stride % LES_TENSOR_ALIGN) {
                 throw std::runtime_error(format(
                     "expert layout: layer %d expert_stride %zu is not a multiple of %zu",
                     layer, expert_stride, LES_TENSOR_ALIGN));
             }
 
-            size_t sum = 0;
+            if (tensor_name.empty() || !carriers.insert(tensor_name).second) {
+                throw std::runtime_error("expert layout: carrier tensor must be unique to one group");
+            }
+            checked_mul(expert_stride, (size_t) group_count);
+            if (!group.at("tensors").is_array() || group.at("tensors").empty()) {
+                throw std::runtime_error("expert layout: group declares no tensor families");
+            }
+            std::vector<std::pair<size_t, size_t>> intervals;
             for (const auto & tensor : group.at("tensors")) {
                 const std::string tensor_family    = tensor.at("tensor_family").get<std::string>();
-                const size_t      offset_in_expert = tensor.at("offset_in_expert").get<size_t>();
-                const size_t      bytes_per_expert = tensor.at("bytes_per_expert").get<size_t>();
+                if (tensor_family.empty()) {
+                    throw std::runtime_error("expert layout: tensor family name must not be empty");
+                }
+                const size_t offset_in_expert = layout_uint(tensor.at("offset_in_expert"), "offset_in_expert");
+                const size_t bytes_per_expert = layout_uint(tensor.at("bytes_per_expert"), "bytes_per_expert");
 
-                if (offset_in_expert % LES_TENSOR_ALIGN || bytes_per_expert % LES_TENSOR_ALIGN) {
+                if (bytes_per_expert == 0 || offset_in_expert % LES_TENSOR_ALIGN ||
+                        bytes_per_expert % LES_TENSOR_ALIGN) {
                     throw std::runtime_error(format(
                         "expert layout: layer %d tensor '%s' is not %zu-byte aligned",
                         layer, tensor_family.c_str(), LES_TENSOR_ALIGN));
                 }
-                if (offset_in_expert + bytes_per_expert > expert_stride) {
+                if (offset_in_expert > expert_stride || bytes_per_expert > expert_stride - offset_in_expert) {
                     throw std::runtime_error(format(
                         "expert layout: layer %d tensor '%s' runs past expert_stride "
                         "(%zu + %zu > %zu)",
@@ -176,21 +256,27 @@ std::unique_ptr<llama_moe_experts> llama_moe_experts::from_layout(
                 entry.bytes_per_expert    = bytes_per_expert;
                 entry.expert_stride       = expert_stride;
                 entry.expert_count        = layer_experts;
-                entry.tensor_bytes        = bytes_per_expert * (size_t) layer_experts;
+                entry.tensor_bytes        = checked_mul(bytes_per_expert, (size_t) layer_experts);
 
                 if (!out->entries.emplace(entry.tensor_name, std::move(entry)).second) {
                     throw std::runtime_error(format(
                         "expert layout: duplicate tensor '%s'",
                         layer_tensor_name(layer, tensor_family).c_str()));
                 }
-                sum += bytes_per_expert;
+                intervals.emplace_back(offset_in_expert, offset_in_expert + bytes_per_expert);
             }
-            if (sum != expert_stride) {
-                throw std::runtime_error(format(
-                    "expert layout: layer %d tensors sum to %zu but expert_stride is %zu",
-                    layer, sum, expert_stride));
+            std::sort(intervals.begin(), intervals.end());
+            size_t end = 0;
+            for (const auto & interval : intervals) {
+                if (interval.first != end) {
+                    throw std::runtime_error("expert layout: tensor families overlap or leave a gap");
+                }
+                end = interval.second;
             }
-            layer_slot_bytes += expert_stride;
+            if (end != expert_stride) {
+                throw std::runtime_error("expert layout: tensor families do not fill expert_stride");
+            }
+            layer_slot_bytes = checked_add(layer_slot_bytes, expert_stride);
             covered = expert_begin + group_count;
         }
         if (covered != layer_experts) {
@@ -209,7 +295,7 @@ std::unique_ptr<llama_moe_experts> llama_moe_experts::from_layout(
     out->n_expert_used = n_expert_used;
     out->n_layer       = (int32_t) layers.size();
     for (size_t bytes : out->bytes_per_slot_layer) {
-        out->bytes_per_slot += bytes;
+        out->bytes_per_slot = checked_add(out->bytes_per_slot, bytes);
     }
 
     if (out->entries.empty()) {
@@ -220,11 +306,31 @@ std::unique_ptr<llama_moe_experts> llama_moe_experts::from_layout(
 
 void llama_moe_experts::bind_region(const std::string & packed_tensor_name,
                                     size_t tensor_offset,
+                                    size_t tensor_bytes,
                                     const std::string & path) {
     // 载体张量在文件里的位置一旦解析出来，就可以给引用它的每条 entry 定绝对偏移。
     // 同一层三个 family 共用一个载体，所以 base 相同、只有 offset_in_expert 不同 ——
     // `finalize_pack` 要求的「同文件、同 stride、族在 stride 内」由此自动成立。
     int bound = 0;
+    checked_add(tensor_offset, tensor_bytes);
+    if (alignment && tensor_offset % alignment) {
+        throw std::runtime_error("expert layout: carrier offset is not aligned");
+    }
+    for (const auto & kv : entries) {
+        const auto & entry = kv.second;
+        if (entry.packed_tensor_name == packed_tensor_name) {
+            const size_t expected = checked_mul(entry.expert_stride, (size_t) entry.expert_count);
+            if (tensor_bytes != expected) {
+                throw std::runtime_error(format("expert layout: carrier '%s' has %zu bytes, expected %zu",
+                    packed_tensor_name.c_str(), tensor_bytes, expected));
+            }
+            ++bound;
+        }
+    }
+    if (bound == 0) {
+        throw std::runtime_error(format(
+            "expert layout references tensor '%s' but no entry uses it", packed_tensor_name.c_str()));
+    }
     for (auto & kv : entries) {
         auto & entry = kv.second;
         if (entry.packed_tensor_name != packed_tensor_name) {
@@ -232,12 +338,6 @@ void llama_moe_experts::bind_region(const std::string & packed_tensor_name,
         }
         entry.offset = tensor_offset + entry.offset_in_expert;
         entry.path   = path;
-        bound++;
-    }
-    if (bound == 0) {
-        throw std::runtime_error(format(
-            "expert layout references tensor '%s' but no entry uses it",
-            packed_tensor_name.c_str()));
     }
 }
 
@@ -305,31 +405,12 @@ bool llama_moe_experts_geometry_from_file(const char * path_model,
     const int key_layout = gguf_find_key(ctx, "les.moe.layout");
     if (key_layout >= 0) {
         try {
-            const auto layout = nlohmann::json::parse(gguf_get_val_str(ctx, key_layout));
-
-            size_t  bytes_per_slot = 0;
-            int32_t n_layer        = 0;
-            int32_t n_expert       = 0;
-            int32_t n_expert_used  = 0;
-
-            for (const auto & layer : layout.at("layers")) {
-                for (const auto & group : layer.at("groups")) {
-                    bytes_per_slot += group.at("expert_stride").get<size_t>();
-                }
-                if (n_layer == 0) {
-                    n_expert      = layer.at("n_expert").get<int32_t>();
-                    n_expert_used = layer.value("n_expert_used", n_expert);
-                }
-                n_layer++;
-            }
-
-            if (n_layer > 0 && bytes_per_slot > 0) {
-                out->n_layer        = n_layer;
-                out->n_expert       = n_expert;
-                out->n_expert_used  = n_expert_used;
-                out->bytes_per_slot = bytes_per_slot;
-                ok = true;
-            }
+            const auto source = llama_moe_experts::from_gguf(ctx, path_model, LLAMA_MAX_LAYERS);
+            out->n_layer        = source->layer_count();
+            out->n_expert       = source->expert_count();
+            out->n_expert_used  = source->expert_used_count();
+            out->bytes_per_slot = source->bytes_per_slot_all_layers();
+            ok = true;
         } catch (const std::exception &) {
             ok = false;
         }

@@ -12,6 +12,35 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifdef GGML_METAL_TESTING
+static _Thread_local struct ggml_metal_test_config test_config;
+static _Thread_local struct ggml_metal_test_stats test_stats;
+static _Thread_local int test_visits;
+
+void ggml_metal_test_configure(struct ggml_metal_test_config config) {
+    test_config = config;
+    test_visits = 0;
+    test_stats.injected = 0;
+}
+
+struct ggml_metal_test_stats ggml_metal_test_get_stats(void) {
+    return test_stats;
+}
+
+static bool ggml_metal_test_fail(enum ggml_metal_test_failure failure) {
+    if (test_config.failure == failure && ++test_visits == test_config.nth) {
+        ++test_stats.injected;
+        return true;
+    }
+    return false;
+}
+#define METAL_TEST_FAIL(point) ggml_metal_test_fail(point)
+#define METAL_TEST_ACCOUNT(field, delta) (test_stats.field += (delta))
+#else
+#define METAL_TEST_FAIL(point) false
+#define METAL_TEST_ACCOUNT(field, delta) ((void) 0)
+#endif
+
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
 #endif
@@ -831,9 +860,11 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 }
             }
 
-            dev->props.use_residency_sets = true;
+            dev->props.use_residency_sets = false;
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
-            dev->props.use_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
+            if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+                dev->props.use_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
+            }
 #endif
 
             dev->props.use_shared_buffers = dev->props.has_unified_memory;
@@ -967,6 +998,7 @@ void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset
     [dev->rsets->lock lock];
 
     [dev->rsets->data addObject:rset];
+    METAL_TEST_ACCOUNT(registered, 1);
 
     [dev->rsets->lock unlock];
 }
@@ -980,6 +1012,11 @@ void ggml_metal_device_rsets_rm(ggml_metal_device_t dev, ggml_metal_rset_t rset)
 
     [dev->rsets->lock lock];
 
+#ifdef GGML_METAL_TESTING
+    if ([dev->rsets->data containsObject:rset]) {
+        METAL_TEST_ACCOUNT(registered, -1);
+    }
+#endif
     [dev->rsets->data removeObject:rset];
 
     [dev->rsets->lock unlock];
@@ -1048,7 +1085,14 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
     if (@available(macOS 10.12, iOS 16.0, *)) {
         *total = dev->mtl_device.recommendedMaxWorkingSetSize;
-        *free  = *total - dev->mtl_device.currentAllocatedSize;
+        size_t allocated = dev->mtl_device.currentAllocatedSize;
+#ifdef GGML_METAL_TESTING
+        if (test_config.override_memory) {
+            *total = test_config.total;
+            allocated = test_config.allocated;
+        }
+#endif
+        *free = *total > allocated ? *total - allocated : 0;
     } else {
         *free = 0;
         *total = 0;
@@ -1452,19 +1496,29 @@ static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf) {
 
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
     if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+        if (METAL_TEST_FAIL(GGML_METAL_TEST_RSET)) {
+            return false;
+        }
         MTLResidencySetDescriptor * desc = [[MTLResidencySetDescriptor alloc] init];
         desc.label = @"ggml_metal";
         desc.initialCapacity = buf->n_buffers;
 
-        NSError * error;
+        NSError * error = nil;
         buf->rset = [buf->dev->mtl_device newResidencySetWithDescriptor:desc error:&error];
-        if (error) {
-            GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
+        if (buf->rset) {
+            METAL_TEST_ACCOUNT(rsets, 1);
+        }
+        if (error || !buf->rset) {
+            GGML_LOG_ERROR("%s: error: %s\n", __func__,
+                error ? [[error description] UTF8String] : "failed to create residency set");
             [desc release];
             return false;
         }
 
         [desc release];
+        if (METAL_TEST_FAIL(GGML_METAL_TEST_RSET_CREATED)) {
+            return false;
+        }
 
         for (int i = 0; i < buf->n_buffers; i++) {
             [buf->rset addAllocation:buf->buffers[i].metal];
@@ -1487,7 +1541,10 @@ static void ggml_metal_buffer_rset_free(ggml_metal_buffer_t buf) {
         if (buf->rset) {
             [buf->rset endResidency];
             [buf->rset removeAllAllocations];
+            [buf->rset commit];
             [buf->rset release];
+            METAL_TEST_ACCOUNT(rsets, -1);
+            buf->rset = nil;
         }
     }
 #else
@@ -1496,6 +1553,9 @@ static void ggml_metal_buffer_rset_free(ggml_metal_buffer_t buf) {
 }
 
 static void * ggml_metal_host_malloc(size_t n) {
+    if (METAL_TEST_FAIL(GGML_METAL_TEST_HOST)) {
+        return NULL;
+    }
     void * data = NULL;
 
 #if TARGET_OS_OSX
@@ -1516,9 +1576,16 @@ static void * ggml_metal_host_malloc(size_t n) {
 }
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared) {
+    if (METAL_TEST_FAIL(GGML_METAL_TEST_METADATA)) {
+        return NULL;
+    }
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+    if (!res) {
+        return NULL;
+    }
 
     res->dev = dev;
+    METAL_TEST_ACCOUNT(metadata, 1);
 
     const size_t size_page = sysconf(_SC_PAGESIZE);
 
@@ -1534,6 +1601,9 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     // allocate shared buffer if the device supports it and it is required by the buffer type
     if (shared) {
         res->all_data = ggml_metal_host_malloc(size_aligned);
+        if (res->all_data) {
+            METAL_TEST_ACCOUNT(host_bytes, (int64_t) size_aligned);
+        }
         res->is_shared = true;
     } else {
         // use virtual address
@@ -1551,7 +1621,7 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
         res->buffers[0].metal_size = size_aligned;
         res->buffers[0].metal      = nil;
 
-        if (size_aligned > 0) {
+        if (size_aligned > 0 && !METAL_TEST_FAIL(GGML_METAL_TEST_BUFFER)) {
             if (props_dev->use_shared_buffers && shared) {
                 res->buffers[0].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:res->all_data
                                                                   length:size_aligned
@@ -1560,6 +1630,9 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
             } else {
                 res->buffers[0].metal = [res->dev->mtl_device newBufferWithLength:size_aligned options:MTLResourceStorageModePrivate];
             }
+            if (res->buffers[0].metal) {
+                METAL_TEST_ACCOUNT(buffers, 1);
+            }
         }
 
         res->buffers[0].data = res->all_data;
@@ -1567,7 +1640,7 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 
     if (size_aligned > 0 && (res->all_data == NULL || res->buffers[0].metal == nil)) {
         GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_aligned / 1024.0 / 1024.0);
-        free(res);
+        ggml_metal_buffer_free(res);
         return NULL;
     }
 
@@ -1575,7 +1648,7 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 
     if (!ggml_metal_buffer_rset_init(res)) {
         GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);
-        free(res);
+        ggml_metal_buffer_free(res);
         return NULL;
     }
 
@@ -1587,9 +1660,16 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 }
 
 ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+    if (METAL_TEST_FAIL(GGML_METAL_TEST_METADATA)) {
+        return NULL;
+    }
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+    if (!res) {
+        return NULL;
+    }
 
     res->dev = dev;
+    METAL_TEST_ACCOUNT(metadata, 1);
 
     res->all_data = ptr;
     res->all_size = size;
@@ -1615,23 +1695,34 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
     const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
 
+    size_t max_buffer_size = props_dev->max_buffer_size;
+#ifdef GGML_METAL_TESTING
+    if (test_config.map_max_size) {
+        max_buffer_size = MIN(max_buffer_size, test_config.map_max_size);
+    }
+#endif
     // the buffer fits into the max buffer size allowed by the device
-    if (size_aligned <= props_dev->max_buffer_size) {
+    if (size_aligned <= max_buffer_size) {
         res->buffers[res->n_buffers].data       = ptr;
         res->buffers[res->n_buffers].size       = size;
         res->buffers[res->n_buffers].metal_size = size_aligned;
         res->buffers[res->n_buffers].metal      = nil;
 
         if (size_aligned > 0) {
-            res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:ptr length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
+            if (!METAL_TEST_FAIL(GGML_METAL_TEST_BUFFER)) {
+                res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:ptr length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
+            }
 
             if (res->buffers[res->n_buffers].metal == nil) {
                 GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_aligned / 1024.0 / 1024.0);
-                free(res);
+                ggml_metal_buffer_free(res);
                 return NULL;
             }
         }
 
+        if (res->buffers[res->n_buffers].metal) {
+            METAL_TEST_ACCOUNT(buffers, 1);
+        }
         ggml_metal_log_allocated_size(res->dev->mtl_device, size_aligned);
 
         ++res->n_buffers;
@@ -1639,8 +1730,8 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
         // this overlap between the views will guarantee that the tensor with the maximum size will fully fit into
         // one of the views
         const size_t size_ovlp = ((max_tensor_size + size_page - 1) / size_page + 1) * size_page; // round-up 2 pages just in case
-        const size_t size_step = props_dev->max_buffer_size - size_ovlp;
-        const size_t size_view = props_dev->max_buffer_size;
+        const size_t size_step = max_buffer_size - size_ovlp;
+        const size_t size_view = max_buffer_size;
 
         for (size_t i = 0; i < size; i += size_step) {
             const size_t size_step_aligned = (i + size_view <= size) ? size_view : (size_aligned - i);
@@ -1651,15 +1742,20 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
             res->buffers[res->n_buffers].metal      = nil;
 
             if (size_step_aligned > 0) {
-                res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:(void *) ((uint8_t *) ptr + i) length:size_step_aligned options:MTLResourceStorageModeShared deallocator:nil];
+                if (!METAL_TEST_FAIL(GGML_METAL_TEST_BUFFER)) {
+                    res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:(void *) ((uint8_t *) ptr + i) length:size_step_aligned options:MTLResourceStorageModeShared deallocator:nil];
+                }
 
                 if (res->buffers[res->n_buffers].metal == nil) {
                     GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_step_aligned / 1024.0 / 1024.0);
-                    free(res);
+                    ggml_metal_buffer_free(res);
                     return NULL;
                 }
             }
 
+            if (res->buffers[res->n_buffers].metal) {
+                METAL_TEST_ACCOUNT(buffers, 1);
+            }
             ggml_metal_log_allocated_size(res->dev->mtl_device, size_step_aligned);
 
             if (i + size_step < size) {
@@ -1674,7 +1770,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
     if (!ggml_metal_buffer_rset_init(res)) {
         GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);
-        free(res);
+        ggml_metal_buffer_free(res);
         return NULL;
     }
 
@@ -1685,14 +1781,17 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
     ggml_metal_device_rsets_rm(buf->dev, buf->rset);
+    ggml_metal_buffer_rset_free(buf);
 
     for (int i = 0; i < buf->n_buffers; i++) {
+        if (buf->buffers[i].metal) {
+            METAL_TEST_ACCOUNT(buffers, -1);
+        }
         [buf->buffers[i].metal release];
     }
 
-    ggml_metal_buffer_rset_free(buf);
-
-    if (buf->is_shared && buf->owned) {
+    if (buf->is_shared && buf->owned && buf->all_data) {
+        METAL_TEST_ACCOUNT(host_bytes, -(int64_t) buf->all_size);
 #if TARGET_OS_OSX
         vm_deallocate((vm_map_t)mach_task_self(), (vm_address_t)buf->all_data, buf->all_size);
 #else
@@ -1700,6 +1799,7 @@ void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
 #endif
     }
 
+    METAL_TEST_ACCOUNT(metadata, -1);
     free(buf);
 }
 
@@ -1722,6 +1822,9 @@ bool ggml_metal_buffer_park(ggml_metal_buffer_t buf) {
         buf->rset = nil;
 
         for (int i = 0; i < buf->n_buffers; i++) {
+            if (buf->buffers[i].metal) {
+                METAL_TEST_ACCOUNT(buffers, -1);
+            }
             [buf->buffers[i].metal release];
             buf->buffers[i].metal = nil;
         }
@@ -1774,12 +1877,15 @@ bool ggml_metal_buffer_unpark(ggml_metal_buffer_t buf) {
         if (buf->buffers[i].metal == nil) {
             GGML_LOG_ERROR("%s: failed to rewrap buffer %d, size = %.2f MiB\n",
                     __func__, i, len / 1024.0 / 1024.0);
+            ggml_metal_buffer_park(buf);
             return false;
         }
+        METAL_TEST_ACCOUNT(buffers, 1);
     }
 
     if (!ggml_metal_buffer_rset_init(buf)) {
         GGML_LOG_ERROR("%s: failed to re-init residency set\n", __func__);
+        ggml_metal_buffer_park(buf);
         return false;
     }
     ggml_metal_device_rsets_add(buf->dev, buf->rset);

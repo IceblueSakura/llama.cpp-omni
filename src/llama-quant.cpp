@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <regex>
 #include <thread>
@@ -961,6 +962,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     model->load_hparams(ml);
     model->load_stats  (ml);
+    if (params->les_experts &&
+            (model->arch != LLM_ARCH_QWEN35MOE && model->arch != LLM_ARCH_MINICPM5_MOE)) {
+        throw std::runtime_error("--les-experts supports only qwen35moe and minicpm5_moe");
+    }
+    if (params->les_experts && (model->hparams.n_expert == 0 ||
+            model->hparams.n_expert > uint32_t(std::numeric_limits<int32_t>::max()) ||
+            model->hparams.n_expert_used == 0 || model->hparams.n_expert_used > model->hparams.n_expert)) {
+        throw std::runtime_error("--les-experts: invalid expert counts");
+    }
 
     quantize_state_impl qs(*model, params);
 
@@ -1028,6 +1038,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     if (params->kv_overrides) {
         for (const llama_model_kv_override * o = params->kv_overrides; o->key[0] != 0; ++o) {
+            if (params->les_experts && std::strcmp(o->key, "general.alignment") == 0 &&
+                    (o->tag != LLAMA_KV_OVERRIDE_TYPE_INT || o->val_i64 != int64_t(align))) {
+                throw std::runtime_error("--les-experts: general.alignment override must be 4096");
+            }
             if (o->tag == LLAMA_KV_OVERRIDE_TYPE_FLOAT) {
                 gguf_set_val_f32(ctx_out.get(), o->key, o->val_f64);
             } else if (o->tag == LLAMA_KV_OVERRIDE_TYPE_INT) {
@@ -1103,7 +1117,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // LES: per layer, the families that will be interleaved into one carrier tensor.
     std::map<int32_t, std::map<std::string, les_family_slot>> les_plan;
     std::map<int32_t, les_region> les_regions;
-    ggml_context * les_meta = nullptr;   // holds the carrier tensor metadata
+    ggml_context_ptr les_meta;   // holds the carrier tensor metadata
 
     //
     // preliminary iteration over all weights
@@ -1135,14 +1149,58 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         } else {
             metadata[i].target_type = tensor->type;
         }
+        if (params->les_experts && !is_les_expert) {
+            // Carrier offsets must not move after any payload has been written.
+            // Reuse the type decision above: the quantization policy is stateful.
+            gguf_set_tensor_type(ctx_outs[i_split].get(), tensor->name, metadata[i].target_type);
+        }
 
         if (is_les_expert) {
-            if (tensor->ne[2] <= 0 || tensor->ne[3] != 1) {
+            int32_t orig_layer = les_layer;
+            if (!mapped.empty()) {
+                orig_layer = -1;
+                const std::string blk_str = std::to_string(les_layer);
+                for (const auto & p : mapped) {
+                    if (p.second == blk_str) {
+                        orig_layer = p.first;
+                        break;
+                    }
+                }
+            }
+            if (les_layer < 0 || uint32_t(les_layer) >= model->hparams.n_layer ||
+                    orig_layer < 0 || uint32_t(orig_layer) >= model->hparams.n_layer) {
+                throw std::runtime_error(format("--les-experts: invalid expert layer for '%s'", tensor->name));
+            }
+            const int64_t n_embd = model->hparams.n_embd;
+            int64_t n_ff = 0;
+            if (model->arch == LLM_ARCH_MINICPM5_MOE) {
+                if (uint32_t(orig_layer) < model->hparams.n_layer_dense_lead) {
+                    throw std::runtime_error(format(
+                            "--les-experts: routed expert tensor '%s' on leading dense layer %d",
+                            tensor->name, orig_layer));
+                }
+                n_ff = model->hparams.n_ff_exp_arr[orig_layer];
+            } else {
+                n_ff = model->hparams.n_ff_exp ?
+                    model->hparams.n_ff_exp : model->hparams.n_ff() / model->hparams.n_expert_used;
+            }
+            if (n_ff <= 0) {
                 throw std::runtime_error(format(
-                        "--les-experts: '%s' is not a 3-D expert stack", tensor->name));
+                        "--les-experts: invalid expert shape for '%s'", tensor->name));
+            }
+            const int64_t n0 = les_family == LES_DOWN ? n_ff : n_embd;
+            const int64_t n1 = les_family == LES_DOWN ? n_embd : n_ff * (les_family == LES_GATE_UP ? 2 : 1);
+            if (tensor->ne[0] != n0 || tensor->ne[1] != n1 ||
+                    tensor->ne[2] != model->hparams.n_expert || tensor->ne[3] != 1) {
+                throw std::runtime_error(format(
+                        "--les-experts: invalid expert shape for '%s'", tensor->name));
             }
             const ggml_type out_type = metadata[i].target_type;
-            const size_t per_expert = ggml_row_size(out_type, tensor->ne[0]) * (size_t) tensor->ne[1];
+            const size_t row = ggml_row_size(out_type, tensor->ne[0]);
+            if (size_t(tensor->ne[1]) > std::numeric_limits<size_t>::max() / row) {
+                throw std::runtime_error("--les-experts: expert size overflow");
+            }
+            const size_t per_expert = row * size_t(tensor->ne[1]);
             if (per_expert % 32 != 0) {
                 throw std::runtime_error(format(
                         "--les-experts: '%s' is %zu bytes per expert, not a multiple of 32",
@@ -1222,6 +1280,26 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         // placeholder for the meta data
         ::zeros(fout, meta_size);
     };
+    auto write_tensor = [&](const char * name, const void * data, size_t size) {
+        if (params->les_experts) {
+            // The table keeps every resident before the carriers, while the
+            // quantization loop may finish a carrier between resident tensors.
+            const auto * ctx = ctx_outs[cur_split].get();
+            const int64_t id = gguf_find_tensor(ctx, name);
+            GGML_ASSERT(id >= 0);
+            const size_t base = gguf_get_meta_size(ctx);
+            const size_t offset = gguf_get_tensor_offset(ctx, id);
+            const size_t padded = GGML_PAD(size, align);
+            const auto max_pos = std::numeric_limits<std::streamoff>::max();
+            if (base > uint64_t(max_pos) || offset > uint64_t(max_pos) - base ||
+                    padded < size || padded > uint64_t(max_pos) - base - offset) {
+                throw std::runtime_error("--les-experts: output offset exceeds stream range");
+            }
+            fout.seekp(std::streamoff(base + offset));
+        }
+        fout.write((const char *) data, size);
+        zeros(fout, GGML_PAD(size, align) - size);
+    };
 
     //
     // LES: build the per-layer regions and register their carrier tensors
@@ -1240,18 +1318,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
-        les_meta = ggml_init(meta_params);
-
-        // n_expert_used is a decode-time property of the model, but the layout declares it
-        // per layer; a missing key makes the loader fall back to n_expert, which then trips
-        // the "expert counts do not match model metadata" check.
-        int64_t n_expert_used = 0;
-        {
-            const int key = gguf_find_key(ml.metadata, ml.llm_kv(LLM_KV_EXPERT_USED_COUNT).c_str());
-            if (key >= 0) {
-                n_expert_used = (int64_t) gguf_get_val_u32(ml.metadata, key);
-            }
+        les_meta.reset(ggml_init(meta_params));
+        if (!les_meta) {
+            throw std::runtime_error("--les-experts: failed to allocate carrier metadata");
         }
+
+        // load_hparams has already applied KV overrides; raw input metadata has not.
+        const int64_t n_expert_used = model->hparams.n_expert_used;
 
         std::string layout = "{\"layout\":\"expert_major_packed\",\"layers\":[";
         bool first_layer = true;
@@ -1259,6 +1332,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         for (auto & plan_it : les_plan) {
             const int32_t layer = plan_it.first;
             auto & families = plan_it.second;
+            const bool fused = families.count(LES_GATE_UP) != 0;
+            if (!families.count(LES_DOWN) ||
+                    (fused ? families.size() != 2 :
+                        families.size() != 3 || !families.count(LES_GATE) || !families.count(LES_UP))) {
+                throw std::runtime_error(format(
+                    "--les-experts: layer %d has incomplete or mixed expert families", layer));
+            }
 
             // Family order gate | up | down fixes the intra-expert layout.
             std::vector<std::pair<std::string, les_family_slot>> ordered;
@@ -1273,6 +1353,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
             size_t stride = 0;
             for (auto & kv : ordered) {
+                if (kv.second.per_expert > std::numeric_limits<size_t>::max() - stride) {
+                    throw std::runtime_error("--les-experts: expert stride overflow");
+                }
                 kv.second.offset = stride;
                 stride += kv.second.per_expert;
                 families[kv.first] = kv.second;
@@ -1299,10 +1382,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             region.stride   = stride;
             region.n_expert = (int32_t) n_expert;
             region.expected = (int) families.size();
+            if (size_t(n_expert) > std::numeric_limits<size_t>::max() / stride) {
+                throw std::runtime_error("--les-experts: carrier size overflow");
+            }
             region.data.assign((size_t) n_expert * stride, 0);
 
             const std::string carrier_name = format("blk.%d.moe_exps_packed.weight", layer);
-            ggml_tensor * carrier = ggml_new_tensor_4d(les_meta, GGML_TYPE_I8,
+            ggml_tensor * carrier = ggml_new_tensor_4d(les_meta.get(), GGML_TYPE_I8,
                     (int64_t) stride, 1, 1, n_expert);
             ggml_set_name(carrier, carrier_name.c_str());
             gguf_add_tensor(ctx_outs[0].get(), carrier);
@@ -1341,8 +1427,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         gguf_set_val_u32(ctx_outs[0].get(), "les.moe.version", 1);
         gguf_set_val_str(ctx_outs[0].get(), "les.moe.layout", layout.c_str());
+        const char * capability = "moe.expert_major_packed_v1";
+        gguf_set_arr_str(ctx_outs[0].get(), "les.moe.requires", &capability, 1);
 
-        LLAMA_LOG_INFO("%s: LES: %zu expert regions, %zu bytes of layout metadata\\n",
+        LLAMA_LOG_INFO("%s: LES: %zu expert regions, %zu bytes of layout metadata\n",
                 __func__, les_regions.size(), layout.size());
     }
 
@@ -1528,26 +1616,20 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 }
                 if (++region.filled == region.expected) {
                     const size_t region_size = region.data.size();
-                    fout.write((const char *) region.data.data(), region_size);
-                    zeros(fout, GGML_PAD(region_size, align) - region_size);
+                    const auto name = format("blk.%d.moe_exps_packed.weight", les_layer);
+                    write_tensor(name.c_str(), region.data.data(), region_size);
                     total_size_new += region_size;
                     std::vector<uint8_t>().swap(region.data);
                 }
             } else {
                 // write tensor data + padding
-                fout.write((const char *) new_data, new_size);
-                zeros(fout, GGML_PAD(new_size, align) - new_size);
+                write_tensor(tensor->name, new_data, new_size);
             }
         } // no --dry-run
     } // main loop
 
     if (!params->dry_run) {
         close_ofstream();
-    }
-
-    if (les_meta) {
-        ggml_free(les_meta);
-        les_meta = nullptr;
     }
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);

@@ -1307,13 +1307,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
-ggml_tensor * llama_model_loader::create_tensor_alloc(
+ggml_tensor * llama_model_loader::create_expert_template(
         const llama_hparams & hparams,
-        ggml_backend_buffer_type_t buft,
         const std::string & name,
         const std::initializer_list<int64_t> & ne,
         ggml_type type) {
-    ggml_context * ctx = ctx_for_buft(hparams, buft);
+    if (!expert_meta) {
+        expert_meta.reset(ggml_init({ggml_tensor_overhead() * (16 * hparams.n_layer + 64), nullptr, true}));
+        if (!expert_meta) {
+            throw std::runtime_error("failed to create LES bank templates");
+        }
+    }
+    ggml_context * ctx = expert_meta.get();
 
     // 与 create_tensor 一样记下 ctx：expert_ctx / last_create_ctx 供后续
     // 建「decode 窗口」的 view 用（见 virtualize_expert_tensor）。
@@ -1596,6 +1601,9 @@ const llama_model_loader::llama_moe_region * llama_model_loader::take_expert_reg
         return nullptr;
     }
 
+    if (it->second.tensor->type != GGML_TYPE_I8) {
+        throw std::runtime_error(format("expert layout: carrier '%s' must have type I8", name));
+    }
     llama_moe_region region;
     region.idx    = it->second.idx;
     region.offset = it->second.offs;
@@ -1608,6 +1616,24 @@ const llama_model_loader::llama_moe_region * llama_model_loader::take_expert_reg
 
     moe_region_begin = std::min(moe_region_begin, region.offset);
     return &moe_regions.emplace(name, region).first->second;
+}
+
+void llama_model_loader::validate_expert_regions() const {
+    std::vector<size_t> first(files.size(), SIZE_MAX);
+    for (const auto & item : moe_regions) {
+        const auto & region = item.second;
+        first.at(region.idx) = std::min(first.at(region.idx), region.offset);
+    }
+    // Offsets are local to each shard. Only resident tensors from that same
+    // file constrain its expert suffix and mmap/prefetch prefix.
+    for (const auto & item : weights_map) {
+        const auto & weight = item.second;
+        if (weight.offs + ggml_nbytes(weight.tensor) > first.at(weight.idx)) {
+            throw std::runtime_error(format(
+                "expert layout: resident tensor '%s' must precede expert regions in its file",
+                item.first.c_str()));
+        }
+    }
 }
 
 size_t llama_model_loader::expert_region_offset() const {

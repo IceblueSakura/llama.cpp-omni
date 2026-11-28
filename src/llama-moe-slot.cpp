@@ -4,6 +4,7 @@
 #include "ggml-cpp.h"
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-moe-storage.h"
 #include "llama-moe-experts.h"
 
 #include <algorithm>
@@ -154,7 +155,8 @@ struct lookahead_expert_prefetch {
     int32_t arm_n = 0;
     int32_t arm_expert[kMaxDepth] = {};
 
-    std::function<void(int, int, int)> read_fn;
+    struct read_result { bool read = false; bool published = false; };
+    std::function<read_result(int, int, int)> read_fn;
     // 窗口模式下 slot 由窗口 LRU 决定，不由乒乓区算出来 —— 此时传给 read_fn 的
     // slot 用 -1 作哨兵（表示「你按窗口自己挑」）。见 impl 的那个 lambda。
     bool window_mode = false;
@@ -174,9 +176,15 @@ struct lookahead_expert_prefetch {
                                               // （用完不保留，本层结束就被重填冲掉）
     std::atomic<uint64_t> n_evict_total{0};   // 淘汰总次数
     std::atomic<uint64_t> n_pred_bytes{0};    // worker 实际读进去的字节
+    std::atomic<uint64_t> n_failed{0};
     bool ready = false;
 
-    void init(int32_t slots, int32_t experts, int32_t last_moe, std::function<void(int, int, int)> fn) {
+    ~lookahead_expert_prefetch() {
+        // Also cover constructor unwinding after a later bank allocation fails.
+        stop();
+    }
+
+    void init(int32_t slots, int32_t experts, int32_t last_moe, std::function<read_result(int, int, int)> fn) {
         n_slots = slots;
         n_expert = experts;
         last_moe_layer = last_moe;
@@ -288,10 +296,11 @@ struct lookahead_expert_prefetch {
         const uint64_t armed = n_armed.load(std::memory_order_relaxed);
         const uint64_t hits = n_hits.load(std::memory_order_relaxed);
         const uint64_t preds = armed * (uint64_t) depth;
-        moe_log("lookahead-prefetch: armed=%llu hits=%llu (%.1f%% of predictions)",
+        moe_log("lookahead-prefetch: armed=%llu hits=%llu (%.1f%% of predictions) failed=%llu",
             (unsigned long long) armed,
             (unsigned long long) hits,
-            preds ? 100.0 * (double) hits / (double) preds : 0.0);
+            preds ? 100.0 * (double) hits / (double) preds : 0.0,
+            (unsigned long long) n_failed.load(std::memory_order_relaxed));
     }
 
     void reset() {
@@ -429,10 +438,18 @@ struct lookahead_expert_prefetch {
                         // 窗口模式传 -1：让 impl 按目标层的窗口 LRU 挑 slot。
                         // 预读写进**目标层自己的窗口**，而不是尾部乒乓区 ——
                         // 这样预读成果直接变成那层的缓存命中，不需要再搬一次。
-                        read_fn(layer, ex[k], window_mode ? -1 : (base + k));
-                        n_pred_read.fetch_add(1, std::memory_order_relaxed);
-                        n_pred_published.fetch_add(1, std::memory_order_relaxed);
-                    } catch (...) {
+                        const auto result = read_fn(layer, ex[k], window_mode ? -1 : (base + k));
+                        if (result.read) {
+                            n_pred_read.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        if (result.published) {
+                            n_pred_published.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            ex[k] = -1;
+                        }
+                    } catch (const std::exception & error) {
+                        moe_log("lookahead-prefetch read failed: layer=%d expert=%d: %s", layer, ex[k], error.what());
+                        n_failed.fetch_add(1, std::memory_order_relaxed);
                         ex[k] = -1;
                     }
                 }
@@ -516,11 +533,37 @@ struct llama_moe_slot_runtime::impl {
     struct map_userdata {
         llama_moe_slot_runtime * runtime = nullptr;
         int layer = -1;
+        bool defer = false;
     };
 
     struct pending_install {
         int32_t expert = -1;
         int32_t slot = -1;
+    };
+
+    static void rollback_pending(layer_state & st, const std::vector<pending_install> & pending) {
+        for (const auto & p : pending) {
+            // A failed read may already have destroyed the evicted bytes.
+            // Never restore the old expert as a valid cache entry.
+            if (st.slot_to_expert[p.slot] == kSlotPending) {
+                st.slot_to_expert[p.slot] = kSlotFree;
+            }
+        }
+    }
+
+    struct install_transaction {
+        layer_state & state;
+        const std::vector<pending_install> & reads;
+        std::vector<pending_install> & deferred;
+        bool committed = false;
+
+        ~install_transaction() {
+            if (!committed) {
+                rollback_pending(state, reads);
+                rollback_pending(state, deferred);
+                deferred.clear();
+            }
+        }
     };
 
     struct install_timing {
@@ -613,15 +656,29 @@ struct llama_moe_slot_runtime::impl {
     uint64_t last_pf_hits = 0;
     uint64_t last_pf_pub = 0;
 
-    explicit impl(const llama_model & model) :
+    std::function<void()> before_wait;
+    std::exception_ptr compute_error;
+    std::atomic<bool> compute_failed{false};
+    int32_t compute_tokens = 0;
+
+    void capture_failure() noexcept {
+        compute_error = std::current_exception();
+        compute_failed.store(true, std::memory_order_release);
+    }
+
+    explicit impl(const llama_model & model, std::function<void(int, int)> before_prefetch,
+                  std::function<void()> before_wait) :
+        predicted(model.layers.size()),
+        miss_per_layer(model.layers.size(), 0),
+        deferred(model.layers.size()),
         model(model),
+        storage(16 * model.layers.size() + 64, model.hparams.no_alloc),
         n_expert((int32_t) model.hparams.n_expert),
         n_slots(model.moe_slot_bank_size()),
         layers(model.layers.size()),
-        predicted(model.layers.size()),
-        deferred(model.layers.size()),
-        miss_per_layer(model.layers.size(), 0),
-        userdata(model.layers.size()) {
+        userdata(model.layers.size()),
+        userdata_deferred(model.layers.size()) {
+        this->before_wait = std::move(before_wait);
         for (size_t il = 0; il < model.layers.size(); ++il) {
             auto & state = layers[il];
             const auto & layer = model.layers[il];
@@ -648,6 +705,7 @@ struct llama_moe_slot_runtime::impl {
             // 才确定，此处还是 0。在那边统一赋值，否则所有层会共用窗口起点 [0, W)，
             // 层间互相覆盖（曾经的实际 bug）。
             userdata[il] = { nullptr, (int) il };
+            userdata_deferred[il] = { nullptr, (int) il, true };
             n_enabled++;
             if (first_moe_layer < 0) {
                 first_moe_layer = (int) il;
@@ -673,10 +731,8 @@ struct llama_moe_slot_runtime::impl {
                 }
             }
         }
-        // Experts loading preadv's the packed expert span straight into its slot, which requires both a
-        // packed layout and CPU-addressable slot tensors. Do not guess either, and do not silently fall
-        // back to an upload path: private Metal buffers (non-unified memory) expose tensor->data as a
-        // virtual address that is not writable from the CPU.
+        // Both shared-direct and staged LES read into CPU-addressable banks.
+        // Private device addresses must never reach preadv.
         for (const auto & layer : layers) {
             if (layer.enabled && !layer.pack_ok) {
                 throw std::runtime_error(
@@ -696,13 +752,33 @@ struct llama_moe_slot_runtime::impl {
             n_pack_ok, n_enabled, (int) n_slots, shared_bank ? "on" : "off",
             (int) n_expert, les_io_threads(), stride0,
             park_window_enabled() ? "on" : "off");
+        moe_log("storage: mode=%s bank=%.2f MiB",
+            storage.requires_upload() ? "host-staged-sync" : "host/shared-direct",
+            storage.size_bytes() / 1048576.0);
 
+        // Staged backends have a single synchronous installation boundary in G1.
+        // A2 rewrites the same source after its scheduler copy; lookahead needs
+        // source pinning while uploads read it. Reject until those protocols land.
+        if (storage.requires_upload()) {
+            const char * prefetch = std::getenv("LLAMA_MOE_LOOKAHEAD_PREFETCH");
+            const char * split = std::getenv("LLAMA_MOE_MATMUL_SPLIT");
+            // Match lookahead.init(): values such as "on", "true" and "-1"
+            // enable the default depth too, rather than parsing as zero.
+            if ((prefetch && *prefetch && *prefetch != '0') || (split && std::atoi(split) > 0)) {
+                throw std::runtime_error(
+                    "staged LES currently requires LLAMA_MOE_LOOKAHEAD_PREFETCH=0 and LLAMA_MOE_MATMUL_SPLIT=0");
+            }
+        }
         lookahead.init((int32_t) n_slots, n_expert, last_moe_layer,
-            [this](int layer, int expert, int slot) {
+            [this, before_prefetch](int layer, int expert, int slot) {
+                if (before_prefetch) {
+                    before_prefetch(layer, expert);
+                }
                 if (slot < 0) {
-                    install_prefetch_into_window(layer, expert);
+                    return install_prefetch_into_window(layer, expert);
                 } else {
                     read_expert_directv(layers[(size_t) layer], expert, slot);
+                    return lookahead_expert_prefetch::read_result{true, true};
                 }
             });
         resolve_decode_window();
@@ -787,8 +863,6 @@ struct llama_moe_slot_runtime::impl {
     /// 与 process() 的安装路径共用同一套 slot 选择规则，所以预读的成果对那层来说
     /// 就是一次普通的缓存命中 —— 不需要乒乓区、也不需要事后搬运。
     ///
-    /// 调用时机保证安全：预读在层 L-1 的 process() 里 arm、在层 L 的 process()
-    /// 开头 take() 处等它结束，所以 worker 动层 L 的窗口时，层 L 没有在跑。
     /// 清空一层缓存的映射表。
     ///
     /// 保留 `kSlotPending`：那是预读 worker 已认领、正在写的 slot。正常路径上
@@ -883,13 +957,13 @@ struct llama_moe_slot_runtime::impl {
         return true;
     }
 
-    void install_prefetch_into_window(int layer, int32_t expert) {
+    lookahead_expert_prefetch::read_result install_prefetch_into_window(int layer, int32_t expert) {
         if (layer < 0 || layer >= (int) layers.size() || decode_window <= 0 || prefetch_slots <= 0) {
-            return;
+            return {};
         }
         auto & st = layers[(size_t) layer];
         if (!st.enabled || expert < 0 || expert >= n_expert) {
-            return;
+            return {};
         }
 
         // 只在**预读暂存区** [window_start + c, window_start + c + K) 里分配。
@@ -904,14 +978,20 @@ struct llama_moe_slot_runtime::impl {
             slot = claim_slot_in_window(st, expert, /*cache_only=*/false);
         }
         if (slot < 0) {
-            return;
+            return {};
         }
 
         // 锁外读盘：这一步不再阻塞主线程。
-        read_expert_directv(st, expert, slot, true);
+        try {
+            read_expert_directv(st, expert, slot, true);
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(st.mutex);
+            st.slot_to_expert[slot] = kSlotFree;
+            throw;
+        }
 
         std::lock_guard<std::mutex> lock(st.mutex);
-        publish_slot_in_window(st, expert, slot);
+        return {true, publish_slot_in_window(st, expert, slot)};
     }
 
     /// ── 缓存预热（LLAMA_MOE_PREWARM）───────────────────────────────────
@@ -938,11 +1018,13 @@ struct llama_moe_slot_runtime::impl {
             return;
         }
         const int64_t t0 = now_ns();
-        struct flat { int layer; int32_t expert; int32_t slot; };
+        struct flat { int layer; int32_t expert; int32_t slot; bool loaded = false; };
 
-        std::vector<std::vector<std::pair<int32_t, int32_t>>> tasks(layers.size());
+        std::vector<flat> q;
+        std::vector<size_t> layer_begin(layers.size() + 1);
         size_t n_req = 0;
         for (size_t il = 0; il < layers.size(); ++il) {
+            layer_begin[il] = q.size();
             if (il >= prewarm_table.size() || prewarm_table[il].empty()) {
                 continue;
             }
@@ -955,7 +1037,7 @@ struct llama_moe_slot_runtime::impl {
                 for (int32_t e : prewarm_table[il]) {
                     const int32_t s = claim_slot_in_window(st, e, /*cache_only=*/true);
                     if (s >= 0) {
-                        tasks[il].push_back({ e, s });
+                        q.push_back({ (int) il, e, s });
                     }
                 }
             };
@@ -966,13 +1048,7 @@ struct llama_moe_slot_runtime::impl {
                 claim_all();
             }
         }
-
-        std::vector<flat> q;
-        for (size_t il = 0; il < tasks.size(); ++il) {
-            for (const auto & t : tasks[il]) {
-                q.push_back({ (int) il, t.first, t.second });
-            }
-        }
+        layer_begin.back() = q.size();
         const int n = (int) q.size();
         const int n_th = std::max(1, std::min(les_io_threads(), n));
         std::atomic<int> next{0};
@@ -987,10 +1063,11 @@ struct llama_moe_slot_runtime::impl {
                 auto & st = layers[(size_t) q[i].layer];
                 try {
                     read_expert_directv(st, q[i].expert, q[i].slot, true);
+                    q[i].loaded = true;
                     n_read.fetch_add(1, std::memory_order_relaxed);
                     n_bytes.fetch_add((int64_t) st.pack_bytes, std::memory_order_relaxed);
-                } catch (...) {
-                    q[i].slot = -1;
+                } catch (const std::exception & error) {
+                    moe_log("prewarm read failed: %s", error.what());
                 }
             }
         };
@@ -1012,15 +1089,18 @@ struct llama_moe_slot_runtime::impl {
         size_t n_pub = 0;
         std::vector<prewarm_place> placed;
         placed.reserve((size_t) n);
-        for (size_t il = 0; il < tasks.size(); ++il) {
-            if (tasks[il].empty()) {
+        for (size_t il = 0; il < layers.size(); ++il) {
+            if (layer_begin[il] == layer_begin[il + 1]) {
                 continue;
             }
             auto & st = layers[il];
             auto pub_all = [&]() {
-                for (const auto & t : tasks[il]) {
-                    if (t.second >= 0 && publish_slot_in_window(st, t.first, t.second)) {
-                        placed.push_back({ (int32_t) il, t.first, t.second });
+                for (size_t i = layer_begin[il]; i < layer_begin[il + 1]; ++i) {
+                    const auto & t = q[i];
+                    if (!t.loaded) {
+                        st.slot_to_expert[t.slot] = kSlotFree;
+                    } else if (publish_slot_in_window(st, t.expert, t.slot)) {
+                        placed.push_back({ (int32_t) il, t.expert, t.slot });
                         n_pub++;
                     }
                 }
@@ -1084,6 +1164,7 @@ struct llama_moe_slot_runtime::impl {
         if (!prewarm_enabled) {
             return;
         }
+        lookahead.drain();
         prewarm_windows(-1);   // -1 = 不持任何层锁，全部自取
     }
 
@@ -1232,6 +1313,8 @@ struct llama_moe_slot_runtime::impl {
     }
 
     ~impl() {
+        moe_log("storage: host/shared=%.2f MiB backend_uploaded=%.2f MiB",
+            storage.size_bytes() / 1048576.0, storage.uploaded_bytes() / 1048576.0);
         if (cur.n_layers > 0) {
             flush_ubatch(cur.n_tokens <= 1 ? "decode" : "prefill",
                 cur.n_tokens <= 1 ? n_decode_step : n_prefill_ubatch);
@@ -1285,7 +1368,22 @@ struct llama_moe_slot_runtime::impl {
             ggml_nbytes(tensor) != entry->bytes_per_expert * (size_t) expect_slots) {
             throw std::runtime_error(format("invalid virtual slot tensor '%s'", ggml_get_name(tensor)));
         }
-        (out ? *out : state.bindings).push_back({ tensor, entry });
+        auto * dev = model.dev_layer(entry->layer);
+        auto * buft = ggml_backend_dev_buffer_type(dev);
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        using alloc_only_fn = ggml_backend_buffer_type_t (*)(size_t);
+        auto alloc_only = (alloc_only_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_buffer_type_alloc_only");
+        if (alloc_only) {
+            for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+                if (ggml_backend_reg_dev_get(reg, i) == dev) {
+                    if (auto * owned_buft = alloc_only(i)) {
+                        buft = owned_buft;
+                    }
+                    break;
+                }
+            }
+        }
+        (out ? *out : state.bindings).push_back({ storage.clone(tensor, buft), entry });
     }
 
     using pack_out = layer_state;
@@ -1946,6 +2044,7 @@ struct llama_moe_slot_runtime::impl {
     }
 
     const llama_model & model;
+    llama_moe_storage storage;
     int32_t n_expert;
     int32_t n_slots;
     int n_enabled = 0;
@@ -2000,6 +2099,7 @@ struct llama_moe_slot_runtime::impl {
     run_stats g_runs;   // 整进程累计；process() 只在 ith==0 上跑，单线程，无需原子
     std::vector<layer_state> layers;
     std::vector<map_userdata> userdata;
+    std::vector<map_userdata> userdata_deferred;
     std::unordered_map<std::string, int> fds;
     std::mutex fd_mutex;
     std::mutex io_mutex;
@@ -2012,6 +2112,8 @@ struct llama_moe_slot_runtime::impl {
     ggml_context_ptr        pred_ctx;
     ggml_backend_buffer_ptr pred_buf;
     ggml_tensor *           pred_state = nullptr;
+    ggml_backend_buffer_type_t pred_buft = nullptr;
+    size_t                  pred_bytes = 0;
     uint64_t                pred_step  = 0;
 
     std::atomic<bool> parked{false};
@@ -2231,7 +2333,11 @@ void llama_moe_slot_runtime::map_custom(
     // 这里在**图执行期间**被调用（CPU 自定义 op），所以这段耗时直接落在关键路径上。
     // 每层一次、每 token 40 次，量出来才能知道它是不是瓶颈。
     const int64_t t0 = now_ns();
-    data->runtime->process(data->layer, src, dst);
+    try {
+        data->runtime->process(data->layer, src, dst, nullptr, data->defer);
+    } catch (...) {
+        data->runtime->pimpl->capture_failure();
+    }
     data->runtime->add_process_ns(now_ns() - t0);
 }
 
@@ -2248,18 +2354,99 @@ void llama_moe_slot_runtime::map_custom_lookahead(
     }
     auto * data = static_cast<llama_moe_slot_runtime::impl::map_userdata *>(userdata);
     const int64_t t0 = now_ns();
-    data->runtime->process(data->layer, a, dst, b);
+    try {
+        data->runtime->process(data->layer, a, dst, b, data->defer);
+    } catch (...) {
+        data->runtime->pimpl->capture_failure();
+    }
     data->runtime->add_process_ns(now_ns() - t0);
 }
 
-llama_moe_slot_runtime::llama_moe_slot_runtime(const llama_model & model) :
-    pimpl(std::make_unique<impl>(model)) {
+llama_moe_slot_runtime::llama_moe_slot_runtime(const llama_model & model,
+        std::function<void(int, int)> before_prefetch, std::function<void()> before_wait) :
+    pimpl(std::make_unique<impl>(model, std::move(before_prefetch), std::move(before_wait))) {
     for (auto & item : pimpl->userdata) {
+        item.runtime = this;
+    }
+    for (auto & item : pimpl->userdata_deferred) {
         item.runtime = this;
     }
 }
 
 llama_moe_slot_runtime::~llama_moe_slot_runtime() = default;
+
+ggml_tensor * llama_moe_slot_runtime::bank_tensor(const ggml_tensor * tensor, bool decode) const {
+    if (!tensor) {
+        return nullptr;
+    }
+    const auto * entry = pimpl->model.moe_experts_entry(ggml_get_name(tensor));
+    GGML_ASSERT(entry);
+    const auto & layer = pimpl->model.layers.at(entry->layer);
+    const std::pair<ggml_tensor *, ggml_tensor *> families[] = {
+        {layer.ffn_gate_up_exps, layer.ffn_gate_up_exps_dec},
+        {layer.ffn_gate_exps, layer.ffn_gate_exps_dec},
+        {layer.ffn_up_exps, layer.ffn_up_exps_dec},
+        {layer.ffn_down_exps, layer.ffn_down_exps_dec},
+    };
+    for (const auto & family : families) {
+        if (tensor == family.first || tensor == family.second) {
+            auto * result = pimpl->storage.get(decode && family.second ? family.second : family.first);
+            GGML_ASSERT(result);
+            return result;
+        }
+    }
+    GGML_ABORT("unknown LES bank template");
+}
+
+bool llama_moe_slot_runtime::owns_tensor(const ggml_tensor * tensor) const {
+    return pimpl->storage.owns(tensor);
+}
+
+bool llama_moe_slot_runtime::copy_weights(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+    return pimpl->storage.copy(backend, src, dst, graph);
+}
+
+uint64_t llama_moe_slot_runtime::uploaded_bytes() const {
+    return pimpl->storage.uploaded_bytes();
+}
+
+bool llama_moe_slot_runtime::failed() const {
+    return pimpl->compute_failed.load(std::memory_order_acquire);
+}
+
+std::exception_ptr llama_moe_slot_runtime::failure() const {
+    return failed() ? pimpl->compute_error : nullptr;
+}
+
+void llama_moe_slot_runtime::reset_failure() {
+    pimpl->compute_error = nullptr;
+    pimpl->compute_failed.store(false, std::memory_order_release);
+}
+
+void llama_moe_slot_runtime::set_ubatch_size(int32_t n_tokens) {
+    GGML_ASSERT(n_tokens > 0);
+    pimpl->compute_tokens = n_tokens;
+}
+
+void llama_moe_slot_runtime::cancel_compute() {
+    pimpl->lookahead.drain();
+    pimpl->cur = impl::ubatch_acc{};
+    pimpl->compute_tokens = 0;
+    for (size_t layer = 0; layer < pimpl->layers.size(); ++layer) {
+        auto & state = pimpl->layers[layer];
+        std::lock_guard<std::mutex> lock(state.mutex);
+        impl::rollback_pending(state, pimpl->deferred[layer]);
+        pimpl->deferred[layer].clear();
+    }
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_moe_slot_runtime::memory_breakdown() const {
+    auto sizes = pimpl->storage.memory_breakdown();
+    if (pimpl->pred_buft && pimpl->pred_bytes > 0) {
+        sizes[pimpl->pred_buft] += pimpl->pred_bytes;
+    }
+    return sizes;
+}
 
 bool llama_moe_slot_runtime::uses_layer(int layer) const {
     return layer >= 0 && layer < (int) pimpl->layers.size() && pimpl->layers[layer].enabled;
@@ -2282,12 +2469,16 @@ void llama_moe_slot_runtime::map_custom_deferred(
     }
     auto * data = static_cast<llama_moe_slot_runtime::impl::map_userdata *>(userdata);
     memcpy(dst->data, a->data, ggml_nbytes(a));
-    data->runtime->process_deferred(data->layer);
+    try {
+        data->runtime->process_deferred(data->layer);
+    } catch (...) {
+        data->runtime->pimpl->capture_failure();
+    }
 }
 
 ggml_tensor * llama_moe_slot_runtime::build_deferred_trigger(
         ggml_context * ctx, ggml_tensor * slot_ids, ggml_tensor * dep, int layer) {
-    return ggml_map_custom2(ctx, slot_ids, dep, map_custom_deferred, 1, &pimpl->userdata[(size_t) layer]);
+    return ggml_map_custom2(ctx, slot_ids, dep, map_custom_deferred, 1, &pimpl->userdata_deferred[(size_t) layer]);
 }
 
 void llama_moe_slot_runtime::add_process_ns(int64_t ns) {
@@ -2335,6 +2526,9 @@ llama_moe_slot_runtime::counters llama_moe_slot_runtime::counters_snapshot() con
 }
 
 void llama_moe_slot_runtime::set_lookahead_prefetch_depth(int depth) {
+    if (depth > 0 && pimpl->storage.requires_upload()) {
+        throw std::runtime_error("lookahead uploads are not yet supported by staged LES");
+    }
     pimpl->lookahead.set_depth(depth);
 }
 
@@ -2361,43 +2555,84 @@ void llama_moe_slot_runtime::map_custom_lookahead_only(
     }
     auto * data = static_cast<llama_moe_slot_runtime::impl::map_userdata *>(userdata);
     auto * p = data->runtime->pimpl.get();
-    const int target = data->layer;   // userdata of the *target* layer
-    const int n = (int) pred->ne[0];
-    memcpy(dst->data, pred->data, (size_t) n * sizeof(int32_t));
-    if (!p->lookahead.enabled) {
-        return;
+    const int64_t t0 = now_ns();
+    try {
+        if (!pred || !dst ||
+            pred->type != GGML_TYPE_I32 || dst->type != GGML_TYPE_I32 ||
+            pred->ne[0] != dst->ne[0] || pred->ne[1] != dst->ne[1]) {
+            throw std::runtime_error(format(
+                "invalid lookahead prediction tensors at layer %d type=%s/%s shape=%lldx%lld vs %lldx%lld",
+                data->layer,
+                ggml_type_name(pred ? pred->type : GGML_TYPE_COUNT),
+                ggml_type_name(dst ? dst->type : GGML_TYPE_COUNT),
+                pred ? (long long) pred->ne[0] : -1,
+                pred ? (long long) pred->ne[1] : -1,
+                dst ? (long long) dst->ne[0] : -1,
+                dst ? (long long) dst->ne[1] : -1));
+        }
+        const int target = data->layer;   // userdata of the *target* layer
+        std::vector<int32_t> ids;
+        p->read_i32_ids(pred, ids);
+        p->write_i32_ids(dst, ids);
+        if (!p->lookahead.enabled) {
+            data->runtime->add_process_ns(now_ns() - t0);
+            return;
+        }
+        // Slot mode: the first window-mode process() of a decode phase (in the first MoE layer,
+        // i.e. `target`) clears every layer's mappings and republishes prewarmed experts. Arming
+        // before that would let the worker write into a slot that is then cleared and republished
+        // under a different expert (wrong weights, no error). So skip the first token of a phase;
+        // from the second token on, was_window is set and arming is safe. Without decode windows
+        // (ping-pong bank tail) there is no such switch.
+        if (p->decode_window > 0 && !p->was_window) {
+            data->runtime->add_process_ns(now_ns() - t0);
+            return;
+        }
+        p->ensure_unparked();
+        p->arm_lookahead(target, ids);
+    } catch (...) {
+        p->capture_failure();
     }
-    // Slot mode: the first window-mode process() of a decode phase (in the first MoE layer,
-    // i.e. `target`) clears every layer's mappings and republishes prewarmed experts. Arming
-    // before that would let the worker write into a slot that is then cleared and republished
-    // under a different expert (wrong weights, no error). So skip the first token of a phase;
-    // from the second token on, was_window is set and arming is safe. Without decode windows
-    // (ping-pong bank tail) there is no such switch.
-    if (p->decode_window > 0 && !p->was_window) {
-        return;
-    }
-    p->ensure_unparked();
-    std::vector<int32_t> ids;
-    p->read_i32_ids(pred, ids);
-    p->arm_lookahead(target, ids);
+    data->runtime->add_process_ns(now_ns() - t0);
 }
 
 ggml_tensor * llama_moe_slot_runtime::predictor_state(int64_t ne0, int64_t ne1, ggml_backend_buffer_type_t buft) {
+    if (ne0 <= 0 || ne1 <= 0 || buft == nullptr) {
+        throw std::runtime_error("predictor_state: invalid shape or buffer type");
+    }
     if (pimpl->pred_state) {
-        if (pimpl->pred_state->ne[0] != ne0 || pimpl->pred_state->ne[1] != ne1) {
-            throw std::runtime_error("predictor_state: shape changed after first use");
+        if (pimpl->pred_state->ne[0] != ne0 || pimpl->pred_state->ne[1] != ne1 || pimpl->pred_buft != buft) {
+            throw std::runtime_error("predictor_state: shape or buffer type changed after first use");
         }
         return pimpl->pred_state;
     }
     ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
-    pimpl->pred_ctx.reset(ggml_init(ip));
-    pimpl->pred_state = ggml_new_tensor_2d(pimpl->pred_ctx.get(), GGML_TYPE_F32, ne0, ne1);
-    ggml_set_name(pimpl->pred_state, "moe_pred_prev_state");
-    pimpl->pred_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pimpl->pred_ctx.get(), buft));
-    if (!pimpl->pred_buf) {
-        throw std::runtime_error("predictor_state: buffer allocation failed");
+    ggml_context_ptr ctx(ggml_init(ip));
+    if (!ctx) {
+        throw std::runtime_error("predictor_state: context creation failed");
     }
-    ggml_backend_buffer_clear(pimpl->pred_buf.get(), 0);
+    ggml_tensor * state = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, ne0, ne1);
+    ggml_set_name(state, "moe_pred_prev_state");
+    const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, state);
+    ggml_backend_buffer_ptr buf;
+    if (pimpl->model.hparams.no_alloc) {
+        buf.reset(ggml_backend_buft_alloc_buffer(buft, 0));
+        if (!buf) {
+            throw std::runtime_error("predictor_state: dummy buffer allocation failed");
+        }
+        state->buffer = buf.get();
+    } else {
+        buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+        if (!buf) {
+            throw std::runtime_error("predictor_state: buffer allocation failed");
+        }
+        ggml_backend_buffer_clear(buf.get(), 0);
+    }
+    pimpl->pred_ctx = std::move(ctx);
+    pimpl->pred_buf = std::move(buf);
+    pimpl->pred_state = state;
+    pimpl->pred_buft = buft;
+    pimpl->pred_bytes = alloc_size;
     pimpl->pred_step = 0;
     return pimpl->pred_state;
 }
@@ -2409,23 +2644,24 @@ uint64_t & llama_moe_slot_runtime::predictor_step() {
 ggml_tensor * llama_moe_slot_runtime::build_slot_ids_tensor(
         ggml_context * ctx,
         ggml_tensor * expert_ids,
-        int layer) {
+        int layer, bool defer) {
     if (!uses_layer(layer)) {
         return expert_ids;
     }
     ggml_tensor * pred = pimpl->lookahead_pending;
     pimpl->lookahead_pending = nullptr;
+    auto * data = defer ? &pimpl->userdata_deferred[layer] : &pimpl->userdata[layer];
     if (pimpl->lookahead.enabled && pred) {
-        return ggml_map_custom2(ctx, expert_ids, pred, map_custom_lookahead, 1, &pimpl->userdata[(size_t) layer]);
+        return ggml_map_custom2(ctx, expert_ids, pred, map_custom_lookahead, 1, data);
     }
-    return ggml_map_custom1(ctx, expert_ids, map_custom, 1, &pimpl->userdata[layer]);
+    return ggml_map_custom1(ctx, expert_ids, map_custom, 1, data);
 }
 
 void llama_moe_slot_runtime::process(
         int layer,
         const ggml_tensor * expert_ids,
         ggml_tensor * slot_ids,
-        const ggml_tensor * lookahead_pred) {
+        const ggml_tensor * lookahead_pred, bool defer) {
     pimpl->ensure_unparked();
     if (!uses_layer(layer) ||
         expert_ids->type != GGML_TYPE_I32 ||
@@ -2452,8 +2688,10 @@ void llama_moe_slot_runtime::process(
     // 最后层经过 `inp_out_ids` 收集后行数可能降到 1（只算要输出的那几行），
     // 用 n_rows 就会把 prefill 的最后一层误判成 decode：窗口路径被打开、
     // 触发中途的阶段切换清缓存，最后层按窗口张量算 —— prefill 结果随之改变。
-    // `cur.n_tokens` 在本次 ubatch 的第一个 MoE 层写入，对后续各层都成立。
-    const int32_t n_tokens_ub = pimpl->cur.n_layers > 0 ? pimpl->cur.n_tokens : n_rows;
+    // Context execution supplies the real ubatch size explicitly. The fallback
+    // only serves isolated runtime calls (including the tiny fixture).
+    const int32_t n_tokens_ub = pimpl->compute_tokens > 0 ? pimpl->compute_tokens :
+        (layer != pimpl->first_moe_layer && pimpl->cur.n_layers > 0 ? pimpl->cur.n_tokens : n_rows);
 
     const bool decode = n_tokens_ub == 1;
     // 窗口也覆盖投机验证这类**小批次**（批宽 = n_max+1）：它们与单 token decode 走
@@ -2464,6 +2702,18 @@ void llama_moe_slot_runtime::process(
     // 「并集装不下」的风险在那里就被消掉，不会落到这里的运行期。
     const bool window_mode = pimpl->decode_window > 0 && n_tokens_ub <= pimpl->window_max_rows;
     const bool lookahead_step = pimpl->lookahead.enabled && decode;
+
+    // Multi-row requests may consume the entire unified window, and prefill
+    // reuses the ping-pong tail. Partitioned windows may consume their only
+    // prefetch slot. Quiesce writers before handing those bytes to consumers.
+    // The single-row unified path retains its bounded, non-blocking behavior:
+    // real slots are touched last and at least K other slots remain for K reads.
+    if (pimpl->lookahead.enabled && (!decode || (window_mode && !pimpl->prefetch_unified))) {
+        if (pimpl->before_wait) {
+            pimpl->before_wait();
+        }
+        pimpl->lookahead.drain();
+    }
 
     // auto 模式下按阶段切 experts 的缓存策略：prefill 绕过、decode 不绕过。
     //
@@ -2478,11 +2728,8 @@ void llama_moe_slot_runtime::process(
         }
     }
 
-    // **只在窗口模式下**需要在加锁之前等预读收工。
-    //
-    // 窗口模式里预读 worker 会锁**目标层**的 mutex 去写它的窗口；若本函数已持
-    // state.mutex 再等 worker，就成了锁序反转 → 死锁（实际踩到过）。
-    // 非窗口模式 worker 只写尾部乒乓区、不碰任何层锁，所以照旧在锁后 take 取结果。
+    // take() for a single-row unified window is non-blocking. All required
+    // writer waits above occur before acquiring a layer mutex.
     if (lookahead_step && window_mode) {
         std::vector<lookahead_expert_prefetch::hit> ignored;   // 窗口模式不返回 hit
         pimpl->lookahead.take(layer, ignored);
@@ -2526,6 +2773,12 @@ void llama_moe_slot_runtime::process(
         } else {
             pimpl->prewarm_windows(layer);
         }
+    }
+    if (window_mode) {
+        // Any real decode consumes the handoff, including idle prewarm called
+        // while a previous decode window was already active.
+        pimpl->prewarm_ready = false;
+        pimpl->prewarm_placed.clear();
     }
     // 阶段判据必须是 `window_mode` 而不是 `decode`：投机验证（批宽 = n_max+1）与
     // 单 token decode 属于**同一个阶段**，它们之间不能清缓存 —— 否则窗口每步都被
@@ -2631,7 +2884,7 @@ void llama_moe_slot_runtime::process(
     }
 
     std::vector<llama_moe_slot_runtime::impl::pending_install> pending;
-    pending.reserve((size_t) std::min((int32_t) pimpl->n_slots, pimpl->n_expert));
+    pending.reserve(std::min(state.slot_to_expert.size(), (size_t) pimpl->n_expert));
 
     // A2：按**名次**决定「现在读」还是「延后读」。末尾 matmul_split 个**名次**的
     // 缺失专家延后到 phase B —— 实测 miss 高度集中在尾部（名次 7 的 miss 是名次 0
@@ -2648,14 +2901,29 @@ void llama_moe_slot_runtime::process(
     // 单 token 时 pos == 名次，两种写法等价。
     auto & defer_list = pimpl->deferred[(size_t) layer];
     defer_list.clear();
+    defer_list.reserve(pending.capacity());
+    llama_moe_slot_runtime::impl::install_transaction transaction{state, pending, defer_list};
+    // Reservations are not hits. Deduplicate this request separately until all
+    // family reads succeed and the transaction publishes its cache entries.
+    std::vector<int32_t> planned = state.expert_to_slot;
     const int32_t n_used_row = (int32_t) expert_ids->ne[0];
     const int32_t split_at   = n_used_row - pimpl->matmul_split;
-    const bool defer_by_rank = window_mode && pimpl->matmul_split > 0 && split_at > 0;
+    // The graph owns A2 eligibility (fused/bias/scale cases have no B trigger).
+    const bool defer_by_rank = defer && window_mode && pimpl->matmul_split > 0 && split_at > 0;
+    std::vector<uint8_t> phase_a;
+    if (defer_by_rank) {
+        phase_a.assign(pimpl->n_expert, 0);
+        for (size_t pos = 0; pos < count; ++pos) {
+            if (int32_t(pos % n_used_row) < split_at) {
+                phase_a[experts[pos]] = 1;
+            }
+        }
+    }
 
     for (size_t pos = 0; pos < count; ++pos) {
         const int32_t expert = experts[pos];
-        if (state.expert_to_slot[expert] >= 0) {
-            slots[pos] = state.expert_to_slot[expert];   // 已驻留，无需读取
+        if (planned[expert] >= 0) {
+            slots[pos] = planned[expert];
             continue;
         }
 
@@ -2710,15 +2978,13 @@ void llama_moe_slot_runtime::process(
         }
         state.slot_age[slot] = ++state.age;
         slots[pos] = slot;
-        const bool defer_this = defer_by_rank &&
-            (int32_t) (pos % (size_t) n_used_row) >= split_at;
+        planned[expert] = slot;
+        state.slot_to_expert[slot] = kSlotPending;
+        const bool defer_this = defer_by_rank && !phase_a[expert];
         if (defer_this) {
             // 延后：槽位标 kSlotPending 占住（别处不会动它），phase B 读完再发布。
-            state.slot_to_expert[slot] = kSlotPending;
             defer_list.push_back({ expert, slot });
         } else {
-            state.slot_to_expert[slot] = expert;
-            state.expert_to_slot[expert] = slot;
             pending.push_back({ expert, slot });
         }
     }
@@ -2733,6 +2999,11 @@ void llama_moe_slot_runtime::process(
 
     const llama_moe_slot_runtime::impl::install_timing timing =
         pimpl->install_pending(state, pending, window_mode);
+    for (const auto & p : pending) {
+        state.slot_to_expert[p.slot] = p.expert;
+        state.expert_to_slot[p.expert] = p.slot;
+    }
+    transaction.committed = true;
     pimpl->install_ns.fetch_add(timing.wall_ns, std::memory_order_relaxed);
 
     if (!pending.empty()) {
@@ -2874,12 +3145,26 @@ void llama_moe_slot_runtime::process_deferred(int layer) {
         return;
     }
 
-    for (const auto & d : list) {
-        pimpl->read_expert_directv(st, d.expert, d.slot, true);
+    try {
+        for (const auto & d : list) {
+            pimpl->read_expert_directv(st, d.expert, d.slot, true);
+        }
+    } catch (...) {
+        std::lock_guard<std::mutex> lk(st.mutex);
+        impl::rollback_pending(st, list);
+        list.clear();
+        throw;
     }
     {
         std::lock_guard<std::mutex> lk(st.mutex);
         for (const auto & d : list) {
+            // A prefetch may have published the same expert while B was pending.
+            // Slot IDs already reference d.slot: retire the duplicate, not B's
+            // reservation, so both maps remain one-to-one.
+            const int32_t previous = st.expert_to_slot[(size_t) d.expert];
+            if (previous >= 0 && previous != d.slot) {
+                st.slot_to_expert[(size_t) previous] = kSlotFree;
+            }
             st.slot_to_expert[(size_t) d.slot] = d.expert;
             st.expert_to_slot[(size_t) d.expert] = d.slot;
         }

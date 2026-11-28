@@ -949,7 +949,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(g
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
-    res.smem = (size_t) ne02*ne20*sizeof(uint16_t);
+    res.smem = GGML_PAD((size_t) ne02*ne20*sizeof(uint16_t), 16);
 
     return res;
 }
